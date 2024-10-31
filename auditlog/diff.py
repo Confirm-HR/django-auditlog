@@ -146,6 +146,9 @@ def model_instance_diff(
             "The supplied new instance is not a valid model instance."
         )
 
+    if old is None and new is None:
+        raise TypeError("Both supplied new and old instances are None.")
+
     diff = {}
 
     if old is not None and new is not None:
@@ -198,7 +201,7 @@ def model_instance_diff(
         fields = filtered_fields
 
     custom_fields_callbacks = auditlog.get_custom_fields_callbacks(
-        new._meta.model
+        new._meta.model if new else old._meta.model
     )
 
     for field in fields:
