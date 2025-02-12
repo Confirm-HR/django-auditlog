@@ -89,9 +89,17 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
 
                 # Attempt to retrieve the specified model
                 try:
-                    model = apps.get_model(
-                        app_label="api", model_name=model_name
-                    )
+                    # First try to get the model from the api app
+                    try:
+                        model = apps.get_model(
+                            app_label="api", model_name=model_name
+                        )
+                    except LookupError:
+                        # If not found in api, try to get User model specifically.
+                        if model_name.lower() in ['user', 'customuser']:
+                            model = get_user_model()
+                        else:
+                            raise
                     if not model:
                         raise LookupError
                 except LookupError:
