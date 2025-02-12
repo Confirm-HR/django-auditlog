@@ -104,25 +104,14 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
                         request._message_shown = True
                     return queryset.none()
 
-                # Attempt to retrieve the object and filter log entries
-                try:
-                    model.objects.only("id").get(pk=object_id)  # Lookup.
-                    content_type = ContentType.objects.get_for_model(model)
-                    queryset = queryset.filter(
-                        content_type=content_type, object_id=object_id
-                    )
-                    # We need to remove `q` from the request to prevent Django
-                    # from trying to search again with structured search query.
-                    request.GET = request.GET.copy()
-                    request.GET.pop("q", None)
-                except ObjectDoesNotExist:
-                    if not getattr(request, "_message_shown", False):
-                        self.message_user(
-                            request,
-                            f"{model_name} instance with ID {object_id} does not exist.",
-                            level="warning",
-                        )
-                        request._message_shown = True
-                    return queryset.none()
+                # Filter log entries
+                content_type = ContentType.objects.get_for_model(model)
+                queryset = queryset.filter(
+                    content_type=content_type, object_id=object_id
+                )
+                # We need to remove `q` from the request to prevent Django
+                # from trying to search again with structured search query.
+                request.GET = request.GET.copy()
+                request.GET.pop("q", None)
 
         return queryset  # Return filtered or default queryset based on the presence of `ss`
