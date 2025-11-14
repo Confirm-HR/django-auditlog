@@ -124,6 +124,13 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             user_table = user_model._meta.db_table
             username_field = user_model.USERNAME_FIELD
 
+            # Set custom similarity threshold (0.03 for broader matching)
+            # The % operator uses pg_trgm.similarity_threshold which defaults to 0.3
+            # Set it to 0.03 for this session, then use % operator (ensures index usage)
+            from django.db import connection
+            with connection.cursor() as cursor:
+                cursor.execute("SET pg_trgm.similarity_threshold = 0.03")
+
             queryset = queryset.filter(
                 RawSQL(
                     """
