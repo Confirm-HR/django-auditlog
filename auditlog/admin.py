@@ -114,14 +114,28 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             # Then use TrigramSimilarity for ranking/ordering
             # The % operator WILL use the GIN index, while similarity() function alone may not
 
-            # Filter using % operator (uses GIN indices) combined with actor field searches
+            # Filter using % operator (uses GIN indices) for ALL fields
             # Using RawSQL for proper parameter binding with .annotate()
             # IMPORTANT: Combine all filters BEFORE annotating to avoid SQL errors from mismatched columns
+
+            # Build SQL that uses % operator for trigram matching on all indexed fields
+            # Migration 0020 adds trigram indices on User model fields (first_name, last_name, username)
+            user_model = get_user_model()
+            user_table = user_model._meta.db_table
+            username_field = user_model.USERNAME_FIELD
+
             queryset = queryset.filter(
-                Q(RawSQL("(object_repr %% %s) OR ((changes)::text %% %s)", (search_term, search_term), output_field=BooleanField())) |
-                Q(actor__first_name__icontains=search_term) |
-                Q(actor__last_name__icontains=search_term) |
-                Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
+                RawSQL(
+                    """
+                    (auditlog_logentry.object_repr %% %s) OR
+                    ((auditlog_logentry.changes)::text %% %s) OR
+                    ({user_table}.first_name %% %s) OR
+                    ({user_table}.last_name %% %s) OR
+                    ({user_table}.{username_field} %% %s)
+                    """.format(user_table=user_table, username_field=username_field),
+                    (search_term, search_term, search_term, search_term, search_term),
+                    output_field=BooleanField()
+                )
             ).annotate(
                 object_repr_similarity=TrigramSimilarity('object_repr', search_term),
                 changes_similarity=TrigramSimilarity(Cast('changes', TextField()), search_term),
