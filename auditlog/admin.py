@@ -118,7 +118,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             # Using RawSQL for proper parameter binding with .annotate()
             # IMPORTANT: Combine all filters BEFORE annotating to avoid SQL errors from mismatched columns
             queryset = queryset.filter(
-                Q(RawSQL("(object_repr % %s) OR ((changes)::text % %s)", (search_term, search_term), output_field=BooleanField())) |
+                Q(RawSQL("(object_repr %% %s) OR ((changes)::text %% %s)", (search_term, search_term), output_field=BooleanField())) |
                 Q(actor__first_name__icontains=search_term) |
                 Q(actor__last_name__icontains=search_term) |
                 Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
