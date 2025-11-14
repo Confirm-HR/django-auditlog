@@ -5,7 +5,9 @@ from django.apps import apps
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
+from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models import Q, Value
 from django.utils.translation import gettext_lazy as _
 
 from auditlog.filters import CIDFilter, ResourceTypeFilter
@@ -66,64 +68,82 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             return super().has_delete_permission(request, obj)
         return False
 
-    def get_queryset(self, request):
-        self.request = request
-        queryset = super().get_queryset(request=request)
-
-        # Custom tampering with Django Admin search.
-        # We support a structured search here to allow
-        # searching for log entries related to a specific object.
-        search = request.GET.get("q")
-        if search:
-            match = STRUCTURED_SEARCH_PATTERN.match(search)
+    def get_search_results(self, request, queryset, search_term):
+        """
+        Override Django admin search to:
+        1. Handle structured search (ModelName:ID) - uses indices
+        2. TODO: Use trigram similarity for free-text (next step)
+        """
+        # Check for structured search pattern first
+        if search_term:
+            match = STRUCTURED_SEARCH_PATTERN.match(search_term)
             if match:
+                # Structured search logic (same as before)
                 try:
                     model_name = match.group("model_name")
                     object_id = int(match.group("id"))
-                except (ValueError, TypeError):
-                    # If the format is incorrect, return an empty queryset and show a message
-                    if not getattr(request, "_message_shown", False):
-                        self.message_user(
-                            request,
-                            "Structured search format must be 'ModelName:id'.",
-                            level="warning",
-                        )
-                        request._message_shown = True
-                    return queryset.none()
 
-                # Attempt to retrieve the specified model
-                try:
-                    # First try to get the model from the api app
                     try:
-                        model = apps.get_model(
-                            app_label="api", model_name=model_name
-                        )
+                        try:
+                            model = apps.get_model(app_label="api", model_name=model_name)
+                        except LookupError:
+                            if model_name.lower() in ['user', 'customuser']:
+                                model = get_user_model()
+                            else:
+                                raise
                     except LookupError:
-                        # If not found in api, try to get User model specifically.
-                        if model_name.lower() in ['user', 'customuser']:
-                            model = get_user_model()
-                        else:
-                            raise
-                    if not model:
-                        raise LookupError
-                except LookupError:
-                    if not getattr(request, "_message_shown", False):
-                        self.message_user(
-                            request,
-                            f"Model '{model_name}' does not exist.",
-                            level="warning",
-                        )
-                        request._message_shown = True
-                    return queryset.none()
+                        self.message_user(request, f"Model '{model_name}' does not exist.", level="warning")
+                        return queryset.none(), False
 
-                # Filter log entries
-                content_type = ContentType.objects.get_for_model(model)
-                queryset = queryset.filter(
-                    content_type=content_type, object_id=object_id
-                )
-                # We need to remove `q` from the request to prevent Django
-                # from trying to search again with structured search query.
-                request.GET = request.GET.copy()
-                request.GET.pop("q", None)
+                    # Filter using indexed fields
+                    content_type = ContentType.objects.get_for_model(model)
+                    queryset = queryset.filter(content_type=content_type, object_id=object_id)
+                    return queryset, False  # False = don't use distinct()
 
-        return queryset  # Return filtered or default queryset based on the presence of `ss`
+                except (ValueError, TypeError):
+                    self.message_user(request, "Structured search format must be 'ModelName:id'.", level="warning")
+                    return queryset.none(), False
+
+        # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
+        # Requires minimum 3 characters for meaningful trigram matching
+        if search_term and len(search_term) >= 3:
+            similarity_threshold = 0.1  # Lower threshold = more results (adjust 0.1-0.3 based on needs)
+
+            # Annotate with trigram similarity scores and filter by threshold
+            # This uses the GIN indices: auditlog_logentry_object_repr_trgm_idx and auditlog_logentry_changes_trgm_idx
+            queryset = queryset.annotate(
+                object_repr_similarity=TrigramSimilarity('object_repr', search_term),
+                changes_similarity=TrigramSimilarity('changes', Value(search_term)),
+            ).filter(
+                Q(object_repr_similarity__gt=similarity_threshold) |
+                Q(changes_similarity__gt=similarity_threshold)
+            ).order_by('-object_repr_similarity', '-changes_similarity')
+
+            # Also search actor fields (foreign key relations - these use ILIKE, not trigram)
+            # These are less common searches, so ILIKE performance is acceptable
+            actor_q = Q(actor__first_name__icontains=search_term) | \
+                      Q(actor__last_name__icontains=search_term) | \
+                      Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
+
+            # Combine trigram results with actor field searches
+            queryset = queryset | self.model.objects.filter(actor_q).filter(pk__in=queryset.values_list('pk', flat=True))
+
+            return queryset.distinct(), False  # False = don't use additional distinct()
+
+        # For very short searches (< 3 chars), return no results with a helpful message
+        # Trigram matching is ineffective on very short strings
+        if search_term:
+            self.message_user(
+                request,
+                "Please enter at least 3 characters for text search, or use structured search (ModelName:ID).",
+                level="warning"
+            )
+            return queryset.none(), False
+
+        # No search term - return all results
+        return super().get_search_results(request, queryset, search_term)
+
+    def get_queryset(self, request):
+        """Get base queryset. Search logic is handled in get_search_results()."""
+        self.request = request
+        return super().get_queryset(request=request)
