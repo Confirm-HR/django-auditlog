@@ -77,6 +77,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         2. Use trigram % operator for free-text filtering - uses GIN indices
         3. Use TrigramSimilarity for ranking results by relevance
         """
+        print("GERMANO MOSCONI", search_term)
         # Check for structured search pattern first
         if search_term:
             match = STRUCTURED_SEARCH_PATTERN.match(search_term)
@@ -119,7 +120,6 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
                     )
                     return queryset.none(), False
 
-        print("GERMANO MOSCONI", search_term)
         # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
