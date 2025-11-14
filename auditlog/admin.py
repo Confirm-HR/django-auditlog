@@ -1,6 +1,6 @@
+import re
 from functools import cached_property
 
-import re
 from django.apps import apps
 from django.contrib import admin
 from django.contrib.auth import get_user_model
@@ -37,8 +37,8 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
     # Migration 0019_add_trigram_indices adds GIN indices on object_repr and changes
     # This enables fast ILIKE searches even on millions of rows
     search_fields = [
-        "object_repr",      # Indexed with gin_trgm_ops - fast text search
-        "changes",          # Indexed with gin_trgm_ops - fast JSON text search
+        "object_repr",  # Indexed with gin_trgm_ops - fast text search
+        "changes",  # Indexed with gin_trgm_ops - fast JSON text search
         "actor__first_name",
         "actor__last_name",
         f"actor__{get_user_model().USERNAME_FIELD}",
@@ -88,25 +88,38 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
 
                     try:
                         try:
-                            model = apps.get_model(app_label="api", model_name=model_name)
+                            model = apps.get_model(
+                                app_label="api", model_name=model_name
+                            )
                         except LookupError:
-                            if model_name.lower() in ['user', 'customuser']:
+                            if model_name.lower() in ["user", "customuser"]:
                                 model = get_user_model()
                             else:
                                 raise
                     except LookupError:
-                        self.message_user(request, f"Model '{model_name}' does not exist.", level="warning")
+                        self.message_user(
+                            request,
+                            f"Model '{model_name}' does not exist.",
+                            level="warning",
+                        )
                         return queryset.none(), False
 
                     # Filter using indexed fields
                     content_type = ContentType.objects.get_for_model(model)
-                    queryset = queryset.filter(content_type=content_type, object_id=object_id)
+                    queryset = queryset.filter(
+                        content_type=content_type, object_id=object_id
+                    )
                     return queryset, False  # False = don't use distinct()
 
                 except (ValueError, TypeError):
-                    self.message_user(request, "Structured search format must be 'ModelName:id'.", level="warning")
+                    self.message_user(
+                        request,
+                        "Structured search format must be 'ModelName:id'.",
+                        level="warning",
+                    )
                     return queryset.none(), False
 
+        print("GERMANO MOSCONI", search_term)
         # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
@@ -128,25 +141,42 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             # The % operator uses pg_trgm.similarity_threshold which defaults to 0.3
             # Set it to 0.03 for this session, then use % operator (ensures index usage)
             from django.db import connection
+
             with connection.cursor() as cursor:
                 cursor.execute("SET pg_trgm.similarity_threshold = 0.03")
 
-            queryset = queryset.filter(
-                RawSQL(
-                    """
+            queryset = (
+                queryset.filter(
+                    RawSQL(
+                        """
                     (auditlog_logentry.object_repr %% %s) OR
                     ((auditlog_logentry.changes)::text %% %s) OR
                     ({user_table}.first_name %% %s) OR
                     ({user_table}.last_name %% %s) OR
                     ({user_table}.{username_field} %% %s)
-                    """.format(user_table=user_table, username_field=username_field),
-                    (search_term, search_term, search_term, search_term, search_term),
-                    output_field=BooleanField()
+                    """.format(
+                            user_table=user_table, username_field=username_field
+                        ),
+                        (
+                            search_term,
+                            search_term,
+                            search_term,
+                            search_term,
+                            search_term,
+                        ),
+                        output_field=BooleanField(),
+                    )
                 )
-            ).annotate(
-                object_repr_similarity=TrigramSimilarity('object_repr', search_term),
-                changes_similarity=TrigramSimilarity(Cast('changes', TextField()), search_term),
-            ).order_by('-object_repr_similarity', '-changes_similarity')
+                .annotate(
+                    object_repr_similarity=TrigramSimilarity(
+                        "object_repr", search_term
+                    ),
+                    changes_similarity=TrigramSimilarity(
+                        Cast("changes", TextField()), search_term
+                    ),
+                )
+                .order_by("-object_repr_similarity", "-changes_similarity")
+            )
 
             return queryset.distinct(), False  # False = don't use additional distinct()
 
@@ -156,7 +186,7 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             self.message_user(
                 request,
                 "Please enter at least 3 characters for text search, or use structured search (ModelName:ID).",
-                level="warning"
+                level="warning",
             )
             return queryset.none(), False
 
