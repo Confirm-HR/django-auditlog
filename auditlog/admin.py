@@ -7,7 +7,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import BooleanField, F, Func, Q, TextField, Value
+from django.db.models import Q, TextField, Value
 from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 
@@ -18,18 +18,6 @@ from auditlog.models import LogEntry
 STRUCTURED_SEARCH_PATTERN = re.compile(
     r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
 )
-
-
-class TrigramSimilar(Func):
-    """
-    Custom database function for PostgreSQL trigram % operator.
-    This operator WILL use the GIN trigram index for filtering.
-    Use this for filtering, then use TrigramSimilarity for ranking.
-    """
-    function = ''
-    arg_joiner = ' % '
-    template = '%(expressions)s'
-    output_field = BooleanField()
 
 
 @admin.register(LogEntry)
@@ -121,14 +109,17 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
-            # CRITICAL: Use the % operator (TrigramSimilar) for filtering to ensure index usage
+            # CRITICAL: Use the % operator via .extra() for filtering to ensure index usage
             # Then use TrigramSimilarity for ranking/ordering
             # The % operator WILL use the GIN index, while similarity() function alone may not
 
             # Filter using % operator (uses GIN indices)
-            queryset = queryset.filter(
-                Q(TrigramSimilar(F('object_repr'), Value(search_term))) |
-                Q(TrigramSimilar(Cast('changes', TextField()), Value(search_term)))
+            # Using .extra() to avoid conflicts with Django's % parameter formatting
+            queryset = queryset.extra(
+                where=[
+                    "(object_repr % %s) OR ((changes)::text % %s)"
+                ],
+                params=[search_term, search_term]
             )
 
             # Annotate with similarity scores for ranking
