@@ -7,7 +7,8 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import BooleanField, Cast, F, Func, Q, TextField, Value
+from django.db.models import BooleanField, F, Func, Q, TextField, Value
+from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 
 from auditlog.filters import CIDFilter, ResourceTypeFilter
