@@ -7,7 +7,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Q, TextField, Value
+from django.db.models import BooleanField, Q, TextField, Value
 from django.db.models.expressions import RawSQL
 from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
@@ -114,24 +114,18 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             # Then use TrigramSimilarity for ranking/ordering
             # The % operator WILL use the GIN index, while similarity() function alone may not
 
-            # Filter using % operator (uses GIN indices)
+            # Filter using % operator (uses GIN indices) combined with actor field searches
             # Using RawSQL for proper parameter binding with .annotate()
+            # IMPORTANT: Combine all filters BEFORE annotating to avoid SQL errors from mismatched columns
             queryset = queryset.filter(
-                RawSQL("(object_repr % %s) OR ((changes)::text % %s)", (search_term, search_term))
+                Q(RawSQL("(object_repr % %s) OR ((changes)::text % %s)", (search_term, search_term), output_field=BooleanField())) |
+                Q(actor__first_name__icontains=search_term) |
+                Q(actor__last_name__icontains=search_term) |
+                Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
             ).annotate(
                 object_repr_similarity=TrigramSimilarity('object_repr', search_term),
                 changes_similarity=TrigramSimilarity(Cast('changes', TextField()), search_term),
             ).order_by('-object_repr_similarity', '-changes_similarity')
-
-            # Also search actor fields (foreign key relations - these use ILIKE, not trigram)
-            # These are less common searches, so ILIKE performance is acceptable
-            actor_q = Q(actor__first_name__icontains=search_term) | \
-                      Q(actor__last_name__icontains=search_term) | \
-                      Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
-
-            # Combine trigram results with actor field searches
-            actor_queryset = self.model.objects.filter(actor_q)
-            queryset = queryset | actor_queryset
 
             return queryset.distinct(), False  # False = don't use additional distinct()
 
