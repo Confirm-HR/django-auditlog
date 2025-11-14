@@ -29,13 +29,16 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         "user_url",
         "cid_url",
     ]
+    # Search fields optimized with PostgreSQL trigram (pg_trgm) indices
+    # Migration 0019_add_trigram_indices adds GIN indices on object_repr and changes
+    # This enables fast ILIKE searches even on millions of rows
     search_fields = [
-        "timestamp",
-        "object_repr",
-        "changes",
+        "object_repr",      # Indexed with gin_trgm_ops - fast text search
+        "changes",          # Indexed with gin_trgm_ops - fast JSON text search
         "actor__first_name",
         "actor__last_name",
         f"actor__{get_user_model().USERNAME_FIELD}",
+        # Note: timestamp removed - use date_hierarchy or filters for date-based search
     ]
     list_filter = ["action", ResourceTypeFilter, CIDFilter]
     readonly_fields = ["created", "resource_url", "action", "user_url", "msg"]
