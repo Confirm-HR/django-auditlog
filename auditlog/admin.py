@@ -8,6 +8,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
 from django.db.models import Q, TextField, Value
+from django.db.models.expressions import RawSQL
 from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 
@@ -109,21 +110,15 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
-            # CRITICAL: Use the % operator via .extra() for filtering to ensure index usage
+            # CRITICAL: Use the % operator via RawSQL for filtering to ensure index usage
             # Then use TrigramSimilarity for ranking/ordering
             # The % operator WILL use the GIN index, while similarity() function alone may not
 
             # Filter using % operator (uses GIN indices)
-            # Using .extra() to avoid conflicts with Django's % parameter formatting
-            queryset = queryset.extra(
-                where=[
-                    "(object_repr % %s) OR ((changes)::text % %s)"
-                ],
-                params=[search_term, search_term]
-            )
-
-            # Annotate with similarity scores for ranking
-            queryset = queryset.annotate(
+            # Using RawSQL for proper parameter binding with .annotate()
+            queryset = queryset.filter(
+                RawSQL("(object_repr % %s) OR ((changes)::text % %s)", (search_term, search_term))
+            ).annotate(
                 object_repr_similarity=TrigramSimilarity('object_repr', search_term),
                 changes_similarity=TrigramSimilarity(Cast('changes', TextField()), search_term),
             ).order_by('-object_repr_similarity', '-changes_similarity')
