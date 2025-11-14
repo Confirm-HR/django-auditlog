@@ -7,7 +7,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import Q, Value
+from django.db.models import BooleanField, Cast, F, Func, Q, TextField, Value
 from django.utils.translation import gettext_lazy as _
 
 from auditlog.filters import CIDFilter, ResourceTypeFilter
@@ -17,6 +17,18 @@ from auditlog.models import LogEntry
 STRUCTURED_SEARCH_PATTERN = re.compile(
     r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
 )
+
+
+class TrigramSimilar(Func):
+    """
+    Custom database function for PostgreSQL trigram % operator.
+    This operator WILL use the GIN trigram index for filtering.
+    Use this for filtering, then use TrigramSimilarity for ranking.
+    """
+    function = ''
+    arg_joiner = ' % '
+    template = '%(expressions)s'
+    output_field = BooleanField()
 
 
 @admin.register(LogEntry)
@@ -71,8 +83,9 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
     def get_search_results(self, request, queryset, search_term):
         """
         Override Django admin search to:
-        1. Handle structured search (ModelName:ID) - uses indices
-        2. TODO: Use trigram similarity for free-text (next step)
+        1. Handle structured search (ModelName:ID) - uses content_type/object_id indices
+        2. Use trigram % operator for free-text filtering - uses GIN indices
+        3. Use TrigramSimilarity for ranking results by relevance
         """
         # Check for structured search pattern first
         if search_term:
@@ -107,16 +120,20 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
-            similarity_threshold = 0.1  # Lower threshold = more results (adjust 0.1-0.3 based on needs)
+            # CRITICAL: Use the % operator (TrigramSimilar) for filtering to ensure index usage
+            # Then use TrigramSimilarity for ranking/ordering
+            # The % operator WILL use the GIN index, while similarity() function alone may not
 
-            # Annotate with trigram similarity scores and filter by threshold
-            # This uses the GIN indices: auditlog_logentry_object_repr_trgm_idx and auditlog_logentry_changes_trgm_idx
+            # Filter using % operator (uses GIN indices)
+            queryset = queryset.filter(
+                Q(TrigramSimilar(F('object_repr'), Value(search_term))) |
+                Q(TrigramSimilar(Cast('changes', TextField()), Value(search_term)))
+            )
+
+            # Annotate with similarity scores for ranking
             queryset = queryset.annotate(
                 object_repr_similarity=TrigramSimilarity('object_repr', search_term),
-                changes_similarity=TrigramSimilarity('changes', Value(search_term)),
-            ).filter(
-                Q(object_repr_similarity__gt=similarity_threshold) |
-                Q(changes_similarity__gt=similarity_threshold)
+                changes_similarity=TrigramSimilarity(Cast('changes', TextField()), search_term),
             ).order_by('-object_repr_similarity', '-changes_similarity')
 
             # Also search actor fields (foreign key relations - these use ILIKE, not trigram)
@@ -126,7 +143,8 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
                       Q(**{f"actor__{get_user_model().USERNAME_FIELD}__icontains": search_term})
 
             # Combine trigram results with actor field searches
-            queryset = queryset | self.model.objects.filter(actor_q).filter(pk__in=queryset.values_list('pk', flat=True))
+            actor_queryset = self.model.objects.filter(actor_q)
+            queryset = queryset | actor_queryset
 
             return queryset.distinct(), False  # False = don't use additional distinct()
 
