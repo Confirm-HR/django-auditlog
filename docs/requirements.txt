@@ -1,5 +1,6 @@
 # Docs requirements
-django>=3.2,<3.3
+django>=4.2,<4.3
 sphinx
 sphinx_rtd_theme
 psycopg2-binary
+mysqlclient==2.2.5

@@ -55,6 +55,22 @@ A DetailView utilizing the LogAccessMixin could look like the following example:
 
         # View code goes here
 
+You can also add log-access to function base views, as the following example illustrates:
+
+.. code-block:: python
+
+    from auditlog.signals import accessed
+
+    def profile_view(request, pk):
+        ## get the object you want to log access
+        user = User.objects.get(pk=pk)
+
+        ## log access
+        accessed.send(user.__class__, instance=user)
+
+        # View code goes here
+        ...
+
 
 **Excluding fields**
 
@@ -115,6 +131,37 @@ method. If ``mask_fields`` is specified, the first half value of the fields is m
 For example, to mask the field ``address``, use::
 
     auditlog.register(MyModel, mask_fields=['address'])
+
+You can also specify a custom masking function by passing ``mask_callable`` to the ``register``
+method. The ``mask_callable`` should be a dotted path to a function that takes a string and returns
+a masked version of that string.
+
+For example, to use a custom masking function::
+
+    # In your_app/utils.py
+    def custom_mask(value: str) -> str:
+        return "****" + value[-4:]  # Only show last 4 characters
+
+    # In your models.py
+    auditlog.register(
+        MyModel,
+        mask_fields=['credit_card'],
+        mask_callable='your_app.utils.custom_mask'
+    )
+
+Additionally, you can set a global default masking function that will be used when a model-specific
+mask_callable is not provided. To do this, add the following to your Django settings::
+
+    AUDITLOG_MASK_CALLABLE = 'your_app.utils.custom_mask'
+
+The masking function priority is as follows:
+
+1. Model-specific ``mask_callable`` if provided in ``register()``
+2. ``AUDITLOG_MASK_CALLABLE`` from settings if configured
+3. Default ``mask_str`` function which masks the first half of the string with asterisks
+
+If ``mask_callable`` is not specified and no global default is configured, the default masking function will be used which masks
+the first half of the string with asterisks.
 
 .. versionadded:: 2.0.0
 
@@ -206,7 +253,7 @@ It will be considered when ``AUDITLOG_INCLUDE_ALL_MODELS`` is `True`.
 
 .. versionadded:: 3.0.0
 
-**AUDITLOG_EXCLUDE_TRACKING_FIELDS**
+**AUDITLOG_DISABLE_REMOTE_ADDR**
 
 When using "AuditlogMiddleware",
 the IP address is logged by default, you can use this setting
@@ -218,6 +265,28 @@ It will be considered when ``AUDITLOG_DISABLE_REMOTE_ADDR`` is `True`.
     AUDITLOG_DISABLE_REMOTE_ADDR = True
 
 .. versionadded:: 3.0.0
+
+**AUDITLOG_MASK_TRACKING_FIELDS**
+
+You can use this setting to mask specific field values in all tracked models
+while still logging changes. This is useful when models contain sensitive fields
+like `password`, `api_key`, or `secret_token` that should not be logged
+in plain text but need to be auditable.
+
+When a masked field changes, its value will be replaced with a masked
+representation (e.g., `****`) in the audit log instead of storing the actual value.
+
+This setting will be applied only when ``AUDITLOG_INCLUDE_ALL_MODELS`` is `True`.
+
+.. code-block:: python
+
+    AUDITLOG_MASK_TRACKING_FIELDS = (
+    "password",
+    "api_key",
+    "secret_token"
+    )
+
+.. versionadded:: 3.1.0
 
 **AUDITLOG_EXCLUDE_TRACKING_MODELS**
 
@@ -288,6 +357,55 @@ The function to use to retrieve the Correlation ID. The value can be a callable 
 If the value is `None`, the default getter will be used.
 
 .. versionadded:: 3.0.0
+
+**AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH**
+
+This configuration variable defines the truncation behavior for strings in `changes_display_dict`, with a default value of `140` characters.
+
+0: The entire string is truncated, resulting in an empty output.
+Positive values (e.g., 5): Truncates the string, keeping only the specified number of characters followed by an ellipsis (...) after the limit.
+Negative values: No truncation occurs, and the full string is displayed.
+
+.. versionadded:: 3.1.0
+
+**AUDITLOG_STORE_JSON_CHANGES**
+
+This configuration variable defines whether to store changes as JSON.
+
+This means that primitives such as booleans, integers, etc. will be represented using their JSON equivalents.  For example, instead of storing
+`None` as a string, it will be stored as a JSON `null` in the `changes` field.  Same goes for other primitives.
+
+.. versionadded:: 3.2.0
+
+**AUDITLOG_USE_BASE_MANAGER**
+
+This configuration variable determines whether to use `base managers
+<https://docs.djangoproject.com/en/dev/topics/db/managers/#base-managers>`_ for
+tracked models instead of their default managers.
+
+This setting can be useful for applications where the default manager behaviour
+hides some objects from the majority of ORM queries:
+
+.. code-block:: python
+
+    class SecretManager(models.Manager):
+        def get_queryset(self):
+            return super().get_queryset().filter(is_secret=False)
+
+
+    @auditlog.register()
+    class SwappedManagerModel(models.Model):
+        is_secret = models.BooleanField(default=False)
+        name = models.CharField(max_length=255)
+
+        objects = SecretManager()
+
+In this example, when ``AUDITLOG_USE_BASE_MANAGER`` is set to `True`, objects
+with the `is_secret` field set will be made visible to Auditlog. Otherwise you
+may see inaccurate data in log entries, recording changes to a seemingly
+"non-existent" object with empty fields.
+
+.. versionadded:: 3.4.0
 
 Actors
 ------
@@ -463,3 +581,26 @@ Django Admin integration
 
 When ``auditlog`` is added to your ``INSTALLED_APPS`` setting a customized admin class is active providing an enhanced
 Django Admin interface for log entries.
+
+Audit log history view
+----------------------
+
+.. versionadded:: 3.2.2
+
+Use ``AuditlogHistoryAdminMixin`` to add a "View" link in the admin changelist for accessing each object's audit history::
+
+    from auditlog.mixins import AuditlogHistoryAdminMixin
+
+    @admin.register(MyModel)
+    class MyModelAdmin(AuditlogHistoryAdminMixin, admin.ModelAdmin):
+        show_auditlog_history_link = True
+
+The history page displays paginated log entries with user, timestamp, action, and field changes. Override
+``auditlog_history_template`` to customize the page layout.
+
+The mixin provides the following configuration options:
+
+- ``show_auditlog_history_link``: Set to ``True`` to display the "View" link in the admin changelist
+- ``auditlog_history_template``: Template to use for rendering the history page (default: ``auditlog/object_history.html``)
+- ``auditlog_history_per_page``: Number of log entries to display per page (default: 10)
+

@@ -2,6 +2,71 @@
 
 ## Next Release
 
+#### Improvements
+
+- Add `AUDITLOG_USE_BASE_MANAGER` setting to override default manager use ([#766](https://github.com/jazzband/django-auditlog/pull/766))
+- Drop 'Python 3.9' support ([#773](https://github.com/jazzband/django-auditlog/pull/773))
+
+## 3.3.0 (2025-09-18)
+
+#### Improvements
+
+- CI: Extend CI and local test coverage to MySQL and SQLite ([#744](https://github.com/jazzband/django-auditlog/pull/744))
+- feat: Add audit log history view to Django Admin. ([#743](https://github.com/jazzband/django-auditlog/pull/743))
+- Fix Expression test compatibility for Django 6.0+ ([#759](https://github.com/jazzband/django-auditlog/pull/759))
+- Add I18N Support ([#762](https://github.com/jazzband/django-auditlog/pull/762))
+
+## 3.2.1 (2025-07-03)
+
+#### Improvements
+
+- Confirm Django 5.2 support. ([#730](https://github.com/jazzband/django-auditlog/pull/730))
+
+#### Fixes
+
+- fix: ```AUDITLOG_STORE_JSON_CHANGES=True``` was not respected during updates and deletions. ([#732](https://github.com/jazzband/django-auditlog/pull/732))
+
+## 3.2.0 (2025-06-26)
+
+#### Improvements
+
+- feat: Support storing JSON in the changes field when ```AUDITLOG_STORE_JSON_CHANGES``` is enabled.  ([#719](https://github.com/jazzband/django-auditlog/pull/719))
+- feat: Added `AUDITLOG_MASK_CALLABLE` setting to allow custom masking functions ([#725](https://github.com/jazzband/django-auditlog/pull/725))
+
+## 3.1.2 (2025-04-26)
+
+#### Fixes
+
+- CI: Pine twine and setuptools to fix release
+
+## 3.1.1 (2025-04-16)
+
+#### Fixes
+
+- CI: Add required pkginfo to release workflow
+
+## 3.1.0 (2025-04-15)
+
+#### Improvements
+
+- feat: Support masking field names globally when ```AUDITLOG_INCLUDE_ALL_MODELS``` is enabled
+via `AUDITLOG_MASK_TRACKING_FIELDS` setting. ([#702](https://github.com/jazzband/django-auditlog/pull/702))
+- feat: Added `LogEntry.actor_email` field. ([#641](https://github.com/jazzband/django-auditlog/pull/641))
+- Add Python 3.13 support. ([#697](https://github.com/jazzband/django-auditlog/pull/671))
+- feat: Added `LogEntry.remote_port` field. ([#671](https://github.com/jazzband/django-auditlog/pull/671))
+- feat: Added `truncate` option to `auditlogflush` management command. ([#681](https://github.com/jazzband/django-auditlog/pull/681))
+- feat: Added `AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH` settings to keep or truncate strings of `changes_display_dict` property at variable length. ([#684](https://github.com/jazzband/django-auditlog/pull/684))
+- Drop Python 3.8 support. ([#678](https://github.com/jazzband/django-auditlog/pull/678))
+- Confirm Django 5.1 support and drop Django 3.2 support. ([#677](https://github.com/jazzband/django-auditlog/pull/677))
+
+#### Fixes
+
+- fix: Use sender instead of receiver for `m2m_changed` signal ID to prevent duplicate entries for models that share a related model. ([#686](https://github.com/jazzband/django-auditlog/pull/686))
+- Fixed a problem when setting `Value(None)` in `JSONField` ([#646](https://github.com/jazzband/django-auditlog/pull/646))
+- Fixed a problem when setting `django.db.models.functions.Now()` in `DateTimeField` ([#635](https://github.com/jazzband/django-auditlog/pull/635))
+- Use the [default manager](https://docs.djangoproject.com/en/5.1/topics/db/managers/#default-managers) instead of `objects` to support custom model managers. ([#705](https://github.com/jazzband/django-auditlog/pull/705))
+- Fixed crashes when cloning objects with `pk=None` ([#707](https://github.com/jazzband/django-auditlog/pull/707))
+
 ## 3.0.0 (2024-04-12)
 
 #### Fixes

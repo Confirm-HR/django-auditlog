@@ -1,6 +1,6 @@
 import uuid
 
-from django.contrib.postgres.fields import ArrayField
+from django.conf import settings
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import models
 
@@ -20,6 +20,7 @@ class SimpleModel(models.Model):
     boolean = models.BooleanField(default=False)
     integer = models.IntegerField(blank=True, null=True)
     datetime = models.DateTimeField(auto_now=True)
+    char = models.CharField(null=True, max_length=100, default=lambda: "default value")
 
     history = AuditlogHistoryField(delete_related=True)
 
@@ -48,6 +49,26 @@ class UUIDPrimaryKeyModel(models.Model):
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    text = models.TextField(blank=True)
+    boolean = models.BooleanField(default=False)
+    integer = models.IntegerField(blank=True, null=True)
+    datetime = models.DateTimeField(auto_now=True)
+
+    history = AuditlogHistoryField(delete_related=True, pk_indexable=False)
+
+
+class ModelPrimaryKeyModel(models.Model):
+    """
+    A model with another model as primary key.
+    """
+
+    key = models.OneToOneField(
+        "SimpleModel",
+        primary_key=True,
+        on_delete=models.CASCADE,
+        related_name="reverse_primary_key",
+    )
 
     text = models.TextField(blank=True)
     boolean = models.BooleanField(default=False)
@@ -109,6 +130,61 @@ class ManyRelatedOtherModel(models.Model):
     """
     A model related to ManyRelatedModel as many-to-many.
     """
+
+    history = AuditlogHistoryField(delete_related=True)
+
+
+class ReusableThroughRelatedModel(models.Model):
+    """
+    A model related to multiple other models through a model.
+    """
+
+    label = models.CharField(max_length=100)
+
+
+class ReusableThroughModel(models.Model):
+    """
+    A through model that can be associated multiple different models.
+    """
+
+    label = models.ForeignKey(
+        ReusableThroughRelatedModel,
+        on_delete=models.CASCADE,
+        related_name="%(app_label)s_%(class)s_items",
+    )
+    one = models.ForeignKey(
+        "ModelForReusableThroughModel", on_delete=models.CASCADE, null=True, blank=True
+    )
+    two = models.ForeignKey(
+        "OtherModelForReusableThroughModel",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+    )
+
+
+class ModelForReusableThroughModel(models.Model):
+    """
+    A model with many-to-many relations through a shared model.
+    """
+
+    name = models.CharField(max_length=200)
+    related = models.ManyToManyField(
+        ReusableThroughRelatedModel, through=ReusableThroughModel
+    )
+
+    history = AuditlogHistoryField(delete_related=True)
+
+
+class OtherModelForReusableThroughModel(models.Model):
+    """
+    Another model with many-to-many relations through a shared model.
+    """
+
+    name = models.CharField(max_length=200)
+    related = models.ManyToManyField(
+        ReusableThroughRelatedModel, through=ReusableThroughModel
+    )
 
     history = AuditlogHistoryField(delete_related=True)
 
@@ -235,26 +311,36 @@ class CharfieldTextfieldModel(models.Model):
     history = AuditlogHistoryField(delete_related=True)
 
 
-class PostgresArrayFieldModel(models.Model):
-    """
-    Test auditlog with Postgres's ArrayField
-    """
+# Only define PostgreSQL-specific models when ArrayField is available
+if settings.TEST_DB_BACKEND == "postgresql":
+    from django.contrib.postgres.fields import ArrayField
 
-    RED = "r"
-    YELLOW = "y"
-    GREEN = "g"
+    class PostgresArrayFieldModel(models.Model):
+        """
+        Test auditlog with Postgres's ArrayField
+        """
 
-    STATUS_CHOICES = (
-        (RED, "Red"),
-        (YELLOW, "Yellow"),
-        (GREEN, "Green"),
-    )
+        RED = "r"
+        YELLOW = "y"
+        GREEN = "g"
 
-    arrayfield = ArrayField(
-        models.CharField(max_length=1, choices=STATUS_CHOICES), size=3
-    )
+        STATUS_CHOICES = (
+            (RED, "Red"),
+            (YELLOW, "Yellow"),
+            (GREEN, "Green"),
+        )
 
-    history = AuditlogHistoryField(delete_related=True)
+        arrayfield = ArrayField(
+            models.CharField(max_length=1, choices=STATUS_CHOICES), size=3
+        )
+
+        history = AuditlogHistoryField(delete_related=True)
+
+else:
+
+    class PostgresArrayFieldModel(models.Model):
+        class Meta:
+            managed = False
 
 
 class NoDeleteHistoryModel(models.Model):
@@ -265,6 +351,12 @@ class NoDeleteHistoryModel(models.Model):
 
 class JSONModel(models.Model):
     json = models.JSONField(default=dict, encoder=DjangoJSONEncoder)
+
+    history = AuditlogHistoryField(delete_related=False)
+
+
+class NullableJSONModel(models.Model):
+    json = models.JSONField(null=True, blank=True)
 
     history = AuditlogHistoryField(delete_related=False)
 
@@ -326,26 +418,94 @@ class SimpleNonManagedModel(models.Model):
         managed = False
 
 
+class SecretManager(models.Manager):
+    def get_queryset(self):
+        return super().get_queryset().filter(is_secret=False)
+
+
+@auditlog.register()
+class SwappedManagerModel(models.Model):
+    is_secret = models.BooleanField(default=False)
+    name = models.CharField(max_length=255)
+
+    objects = SecretManager()
+
+    def __str__(self):
+        return str(self.name)
+
+
+@auditlog.register()
+class SecretRelatedModel(RelatedModelParent):
+    """
+    A RelatedModel, but with a foreign key to an object that could be secret.
+    """
+
+    related = models.ForeignKey(
+        "SwappedManagerModel", related_name="related_models", on_delete=models.CASCADE
+    )
+    one_to_one = models.OneToOneField(
+        to="SwappedManagerModel",
+        on_delete=models.CASCADE,
+        related_name="reverse_one_to_one",
+    )
+
+    history = AuditlogHistoryField(delete_related=True)
+
+    def __str__(self):
+        return f"SecretRelatedModel #{self.pk} -> {self.related.id}"
+
+
+class SecretM2MModel(models.Model):
+    m2m_related = models.ManyToManyField(
+        "SwappedManagerModel", related_name="m2m_related"
+    )
+    name = models.CharField(max_length=255)
+
+    def __str__(self):
+        return str(self.name)
+
+
 class AutoManyRelatedModel(models.Model):
     related = models.ManyToManyField(SimpleModel)
 
 
+class CustomMaskModel(models.Model):
+    credit_card = models.CharField(max_length=16)
+    text = models.TextField()
+
+    history = AuditlogHistoryField(delete_related=True)
+
+
+class NullableFieldModel(models.Model):
+    time = models.TimeField(null=True, blank=True)
+    optional_text = models.CharField(max_length=100, null=True, blank=True)
+
+    history = AuditlogHistoryField(delete_related=True)
+
+
 auditlog.register(AltPrimaryKeyModel)
 auditlog.register(UUIDPrimaryKeyModel)
+auditlog.register(ModelPrimaryKeyModel)
 auditlog.register(ProxyModel)
 auditlog.register(RelatedModel)
 auditlog.register(ManyRelatedModel)
 auditlog.register(ManyRelatedModel.recursive.through)
 m2m_only_auditlog.register(ManyRelatedModel, m2m_fields={"related"})
+m2m_only_auditlog.register(ModelForReusableThroughModel, m2m_fields={"related"})
+m2m_only_auditlog.register(OtherModelForReusableThroughModel, m2m_fields={"related"})
+m2m_only_auditlog.register(SecretM2MModel, m2m_fields={"m2m_related"})
+m2m_only_auditlog.register(SwappedManagerModel, m2m_fields={"m2m_related"})
 auditlog.register(SimpleExcludeModel, exclude_fields=["text"])
 auditlog.register(SimpleMappingModel, mapping_fields={"sku": "Product No."})
 auditlog.register(AdditionalDataIncludedModel)
 auditlog.register(DateTimeFieldModel)
 auditlog.register(ChoicesFieldModel)
 auditlog.register(CharfieldTextfieldModel)
-auditlog.register(PostgresArrayFieldModel)
+if settings.TEST_DB_BACKEND == "postgresql":
+    auditlog.register(PostgresArrayFieldModel)
 auditlog.register(NoDeleteHistoryModel)
 auditlog.register(JSONModel)
+auditlog.register(NullableJSONModel)
 auditlog.register(
     SerializeThisModel,
     serialize_data=True,
@@ -363,3 +523,9 @@ auditlog.register(
     serialize_data=True,
     serialize_kwargs={"use_natural_foreign_keys": True},
 )
+auditlog.register(
+    CustomMaskModel,
+    mask_fields=["credit_card"],
+    mask_callable="auditlog_tests.test_app.mask.custom_mask_str",
+)
+auditlog.register(NullableFieldModel)

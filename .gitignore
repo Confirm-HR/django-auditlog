@@ -48,7 +48,6 @@ coverage.xml
 cover/
 
 # Translations
-*.mo
 *.pot
 
 # Django stuff:
@@ -80,3 +79,4 @@ venv.bak/
 
 ### JetBrains
 .idea/
+.vscode/

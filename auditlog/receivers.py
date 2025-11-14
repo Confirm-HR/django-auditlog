@@ -4,7 +4,7 @@ from django.conf import settings
 
 from auditlog.context import auditlog_disabled
 from auditlog.diff import model_instance_diff
-from auditlog.models import LogEntry
+from auditlog.models import LogEntry, _get_manager_from_settings
 from auditlog.signals import post_log, pre_log
 
 
@@ -43,6 +43,7 @@ def log_create(sender, instance, created, **kwargs):
             sender=sender,
             diff_old=None,
             diff_new=instance,
+            use_json_for_changes=settings.AUDITLOG_STORE_JSON_CHANGES,
         )
 
 
@@ -53,9 +54,9 @@ def log_update(sender, instance, **kwargs):
 
     Direct use is discouraged, connect your model through :py:func:`auditlog.registry.register` instead.
     """
-    if not instance._state.adding:
+    if not instance._state.adding and instance.pk is not None:
         update_fields = kwargs.get("update_fields", None)
-        old = sender.objects.filter(pk=instance.pk).first()
+        old = _get_manager_from_settings(sender).filter(pk=instance.pk).first()
         _create_log_entry(
             action=LogEntry.Action.UPDATE,
             instance=instance,
@@ -63,6 +64,7 @@ def log_update(sender, instance, **kwargs):
             diff_old=old,
             diff_new=instance,
             fields_to_check=update_fields,
+            use_json_for_changes=settings.AUDITLOG_STORE_JSON_CHANGES,
         )
 
 
@@ -80,6 +82,7 @@ def log_delete(sender, instance, **kwargs):
             sender=sender,
             diff_old=instance,
             diff_new=None,
+            use_json_for_changes=settings.AUDITLOG_STORE_JSON_CHANGES,
         )
 
 
@@ -97,11 +100,19 @@ def log_access(sender, instance, **kwargs):
             diff_old=None,
             diff_new=None,
             force_log=True,
+            use_json_for_changes=settings.AUDITLOG_STORE_JSON_CHANGES,
         )
 
 
 def _create_log_entry(
-    action, instance, sender, diff_old, diff_new, fields_to_check=None, force_log=False
+    action,
+    instance,
+    sender,
+    diff_old,
+    diff_new,
+    fields_to_check=None,
+    force_log=False,
+    use_json_for_changes=False,
 ):
     pre_log_results = pre_log.send(
         sender,
@@ -117,7 +128,10 @@ def _create_log_entry(
     changes = None
     try:
         changes = model_instance_diff(
-            diff_old, diff_new, fields_to_check=fields_to_check
+            diff_old,
+            diff_new,
+            fields_to_check=fields_to_check,
+            use_json_for_changes=use_json_for_changes,
         )
 
         if force_log or changes:
@@ -141,6 +155,7 @@ def _create_log_entry(
                 changes=changes,
                 log_entry=log_entry,
                 log_created=log_entry is not None,
+                use_json_for_changes=settings.AUDITLOG_STORE_JSON_CHANGES,
             )
         if error:
             raise error
@@ -155,10 +170,12 @@ def make_log_m2m_changes(field_name):
         if action not in ["post_add", "post_clear", "post_remove"]:
             return
 
+        model_manager = _get_manager_from_settings(kwargs["model"])
+
         if action == "post_clear":
-            changed_queryset = kwargs["model"].objects.all()
+            changed_queryset = model_manager.all()
         else:
-            changed_queryset = kwargs["model"].objects.filter(pk__in=kwargs["pk_set"])
+            changed_queryset = model_manager.filter(pk__in=kwargs["pk_set"])
 
         if action in ["post_add"]:
             LogEntry.objects.log_m2m_changes(

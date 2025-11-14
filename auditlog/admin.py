@@ -19,6 +19,7 @@ STRUCTURED_SEARCH_PATTERN = re.compile(
 
 @admin.register(LogEntry)
 class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
+    date_hierarchy = "timestamp"
     list_select_related = ["content_type", "actor"]
     list_display = [
         "created",

@@ -2,11 +2,13 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from django.conf import settings
 from django.core.management import CommandError, call_command
 from django.test import TestCase, override_settings
+from django.test.utils import skipIf
+from test_app.models import SimpleModel
 
 from auditlog.models import LogEntry
-from auditlog_tests.models import SimpleModel
 
 
 class TwoStepMigrationTest(TestCase):
@@ -44,6 +46,7 @@ class AuditlogMigrateJsonTest(TestCase):
     def call_command(self, *args, **kwargs):
         outbuf = StringIO()
         errbuf = StringIO()
+        args = ("--no-color",) + args
         call_command(
             "auditlogmigratejson", *args, stdout=outbuf, stderr=errbuf, **kwargs
         )
@@ -123,6 +126,7 @@ class AuditlogMigrateJsonTest(TestCase):
         # Assert
         self.assertEqual(call_count, 2)
 
+    @skipIf(settings.TEST_DB_BACKEND != "postgresql", "PostgreSQL-specific test")
     def test_native_postgres(self):
         # Arrange
         log_entry = self.make_logentry()
@@ -134,6 +138,22 @@ class AuditlogMigrateJsonTest(TestCase):
         # Assert
         self.assertEqual(errbuf, "")
         self.assertIsNotNone(log_entry.changes)
+
+    @skipIf(settings.TEST_DB_BACKEND != "postgresql", "PostgreSQL-specific test")
+    def test_native_postgres_changes_not_overwritten(self):
+        # Arrange
+        log_entry = self.make_logentry()
+        log_entry.changes = original_changes = {"key": "value"}
+        log_entry.changes_text = '{"key": "new value"}'
+        log_entry.save()
+
+        # Act
+        outbuf, errbuf = self.call_command("-d=postgres")
+        log_entry.refresh_from_db()
+
+        # Assert
+        self.assertEqual(errbuf, "")
+        self.assertEqual(log_entry.changes, original_changes)
 
     def test_native_unsupported(self):
         # Arrange

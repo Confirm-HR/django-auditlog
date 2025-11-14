@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import freezegun
 from dateutil.tz import gettz
+from django import VERSION as DJANGO_VERSION
 from django.apps import apps
 from django.conf import settings
 from django.contrib.admin.sites import AdminSite
@@ -17,37 +18,36 @@ from django.contrib.auth.models import AnonymousUser, User
 from django.contrib.contenttypes.models import ContentType
 from django.core import management
 from django.db import models
+from django.db.models import JSONField, Value
+from django.db.models.functions import Now
 from django.db.models.signals import pre_save
-from django.test import RequestFactory, TestCase, override_settings
+from django.test import RequestFactory, TestCase, TransactionTestCase, override_settings
 from django.urls import resolve, reverse
 from django.utils import dateformat, formats
 from django.utils import timezone as django_timezone
 from django.utils.encoding import smart_str
 from django.utils.translation import gettext_lazy as _
-
-from auditlog.admin import LogEntryAdmin
-from auditlog.cid import get_cid
-from auditlog.context import disable_auditlog, set_actor
-from auditlog.diff import model_instance_diff
-from auditlog.middleware import AuditlogMiddleware
-from auditlog.models import DEFAULT_OBJECT_REPR, LogEntry
-from auditlog.registry import AuditlogModelRegistry, AuditLogRegistrationError, auditlog
-from auditlog.signals import post_log, pre_log
-from auditlog_tests.fixtures.custom_get_cid import get_cid as custom_get_cid
-from auditlog_tests.models import (
+from test_app.fixtures.custom_get_cid import get_cid as custom_get_cid
+from test_app.models import (
     AdditionalDataIncludedModel,
     AltPrimaryKeyModel,
     AutoManyRelatedModel,
     CharfieldTextfieldModel,
     ChoicesFieldModel,
+    CustomMaskModel,
     DateTimeFieldModel,
     JSONModel,
     ManyRelatedModel,
     ManyRelatedOtherModel,
+    ModelForReusableThroughModel,
+    ModelPrimaryKeyModel,
     NoDeleteHistoryModel,
-    PostgresArrayFieldModel,
+    NullableJSONModel,
     ProxyModel,
     RelatedModel,
+    ReusableThroughRelatedModel,
+    SecretM2MModel,
+    SecretRelatedModel,
     SerializeNaturalKeyRelatedModel,
     SerializeOnlySomeOfThisModel,
     SerializePrimaryKeyRelatedModel,
@@ -58,8 +58,18 @@ from auditlog_tests.models import (
     SimpleMaskedModel,
     SimpleModel,
     SimpleNonManagedModel,
+    SwappedManagerModel,
     UUIDPrimaryKeyModel,
 )
+
+from auditlog.admin import LogEntryAdmin
+from auditlog.cid import get_cid
+from auditlog.context import disable_auditlog, set_actor
+from auditlog.diff import mask_str, model_instance_diff
+from auditlog.middleware import AuditlogMiddleware
+from auditlog.models import DEFAULT_OBJECT_REPR, LogEntry
+from auditlog.registry import AuditlogModelRegistry, AuditLogRegistrationError, auditlog
+from auditlog.signals import post_log, pre_log
 
 
 class SimpleModelTest(TestCase):
@@ -228,6 +238,13 @@ class SimpleModelTest(TestCase):
         history = self.obj.history.filter(timestamp=timestamp, changes="foo bar")
         self.assertTrue(history.exists())
 
+    def test_create_duplicate_with_pk_none(self):
+        initial_entries_count = LogEntry.objects.count()
+        obj = self.obj
+        obj.pk = None
+        obj.save()
+        self.assertEqual(LogEntry.objects.count(), initial_entries_count + 1)
+
 
 class NoActorMixin:
     def check_create_log_entry(self, obj, log_entry):
@@ -256,7 +273,10 @@ class WithActorMixin:
         super().setUp()
 
     def tearDown(self):
+        user_email = self.user.email
         self.user.delete()
+        auditlog_entries = LogEntry.objects.filter(actor_email=user_email).all()
+        self.assertIsNotNone(auditlog_entries, msg="All auditlog entries are deleted.")
         super().tearDown()
 
     def make_object(self):
@@ -266,6 +286,7 @@ class WithActorMixin:
     def check_create_log_entry(self, obj, log_entry):
         super().check_create_log_entry(obj, log_entry)
         self.assertEqual(log_entry.actor, self.user)
+        self.assertEqual(log_entry.actor_email, self.user.email)
 
     def update(self, obj):
         with set_actor(self.user):
@@ -274,6 +295,7 @@ class WithActorMixin:
     def check_update_log_entry(self, obj, log_entry):
         super().check_update_log_entry(obj, log_entry)
         self.assertEqual(log_entry.actor, self.user)
+        self.assertEqual(log_entry.actor_email, self.user.email)
 
     def delete(self, obj):
         with set_actor(self.user):
@@ -282,6 +304,7 @@ class WithActorMixin:
     def check_delete_log_entry(self, obj, log_entry):
         super().check_delete_log_entry(obj, log_entry)
         self.assertEqual(log_entry.actor, self.user)
+        self.assertEqual(log_entry.actor_email, self.user.email)
 
 
 class AltPrimaryKeyModelBase(SimpleModelTest):
@@ -329,6 +352,44 @@ class UUIDPrimaryKeyModelModelWithActorTest(
     pass
 
 
+class ModelPrimaryKeyModelBase(SimpleModelTest):
+    def make_object(self):
+        self.key = super().make_object()
+        return ModelPrimaryKeyModel.objects.create(key=self.key, text="I am strange.")
+
+    def test_create_duplicate_with_pk_none(self):
+        pass
+
+
+class ModelPrimaryKeyModelTest(NoActorMixin, ModelPrimaryKeyModelBase):
+    pass
+
+
+class ModelPrimaryKeyModelWithActorTest(WithActorMixin, ModelPrimaryKeyModelBase):
+    pass
+
+
+# Must inherit from TransactionTestCase to use self.assertNumQueries.
+class ModelPrimaryKeyTest(TransactionTestCase):
+    def test_get_pk_value(self):
+        """
+        Test that the primary key can be retrieved without additional database queries.
+        """
+        key = SimpleModel.objects.create(text="I am not difficult.")
+        obj = ModelPrimaryKeyModel.objects.create(key=key, text="I am strange.")
+        # Refresh the object so the primary key object is not cached.
+        obj.refresh_from_db()
+        with self.assertNumQueries(0):
+            pk = LogEntry.objects._get_pk_value(obj)
+        self.assertEqual(pk, obj.pk)
+        self.assertEqual(pk, key.pk)
+        # Sanity check: verify accessing obj.key causes database access.
+        with self.assertNumQueries(1):
+            pk = obj.key.pk
+        self.assertEqual(pk, obj.pk)
+        self.assertEqual(pk, key.pk)
+
+
 class ProxyModelBase(SimpleModelTest):
     def make_object(self):
         return ProxyModel.objects.create(text="I am not what you think.")
@@ -351,6 +412,8 @@ class ManyRelatedModelTest(TestCase):
         self.obj = ManyRelatedModel.objects.create()
         self.recursive = ManyRelatedModel.objects.create()
         self.related = ManyRelatedOtherModel.objects.create()
+        self.obj_reusable = ModelForReusableThroughModel.objects.create()
+        self.obj_reusable_related = ReusableThroughRelatedModel.objects.create()
         self.base_log_entry_count = (
             LogEntry.objects.count()
         )  # created by the create() calls above
@@ -445,6 +508,11 @@ class ManyRelatedModelTest(TestCase):
             self.obj.related.add(self.related)
             log_entry = self.obj.history.first()
             self.assertEqual(log_entry.object_repr, DEFAULT_OBJECT_REPR)
+
+    def test_changes_not_duplicated_with_reusable_through_model(self):
+        self.obj_reusable.related.add(self.obj_reusable_related)
+        entries = self.obj_reusable.history.all()
+        self.assertEqual(len(entries), 1)
 
 
 class MiddlewareTest(TestCase):
@@ -546,6 +614,13 @@ class MiddlewareTest(TestCase):
                     self.middleware._get_remote_addr(request), expected_remote_addr
                 )
 
+    def test_get_remote_port(self):
+        headers = {
+            "HTTP_X_FORWARDED_PORT": "12345",
+        }
+        request = self.factory.get("/", **headers)
+        self.assertEqual(self.middleware._get_remote_port(request), 12345)
+
     def test_cid(self):
         header = str(settings.AUDITLOG_CID_HEADER).lstrip("HTTP_").replace("_", "-")
         header_meta = "HTTP_" + header.upper().replace("-", "_")
@@ -559,9 +634,7 @@ class MiddlewareTest(TestCase):
             # these two tuples test using a custom getter.
             # Here, we don't necessarily care about the cid that was set in set_cid
             (
-                {
-                    "AUDITLOG_CID_GETTER": "auditlog_tests.fixtures.custom_get_cid.get_cid"
-                },
+                {"AUDITLOG_CID_GETTER": "test_app.fixtures.custom_get_cid.get_cid"},
                 custom_get_cid(),
             ),
             ({"AUDITLOG_CID_GETTER": custom_get_cid}, custom_get_cid()),
@@ -583,9 +656,10 @@ class MiddlewareTest(TestCase):
         The remote address will be set even when there is no actor
         """
         remote_addr = "123.213.145.99"
+        remote_port = 12345
         actor = None
 
-        with set_actor(actor=actor, remote_addr=remote_addr):
+        with set_actor(actor=actor, remote_addr=remote_addr, remote_port=remote_port):
             obj = SimpleModel.objects.create(text="I am not difficult.")
 
             history = obj.history.get()
@@ -593,6 +667,11 @@ class MiddlewareTest(TestCase):
                 history.remote_addr,
                 remote_addr,
                 msg=f"Remote address is {remote_addr}",
+            )
+            self.assertEqual(
+                history.remote_port,
+                remote_port,
+                msg=f"Remote port is {remote_port}",
             )
             self.assertIsNone(history.actor, msg="Actor is `None` for anonymous user")
 
@@ -721,6 +800,57 @@ class SimpleMappingModelTest(TestCase):
             ),
         )
 
+    @override_settings(AUDITLOG_STORE_JSON_CHANGES=True)
+    def test_changes_display_dict_with_json_changes_and_simplemodel(self):
+        sm = SimpleModel(integer=37, text="my simple model instance")
+        sm.save()
+        self.assertEqual(
+            sm.history.latest().changes_display_dict["integer"][1],
+            "37",
+        )
+        self.assertEqual(
+            sm.history.latest().changes_display_dict["text"][1],
+            "my simple model instance",
+        )
+
+    @override_settings(AUDITLOG_STORE_JSON_CHANGES=True)
+    def test_register_mapping_fields_with_json_changes(self):
+        smm = SimpleMappingModel(
+            sku="ASD301301A6", vtxt="2.1.5", not_mapped="Not mapped"
+        )
+        smm.save()
+        self.assertEqual(
+            smm.history.latest().changes_dict["sku"][1],
+            "ASD301301A6",
+            msg="The diff function retains 'sku' and can be retrieved.",
+        )
+        self.assertEqual(
+            smm.history.latest().changes_dict["not_mapped"][1],
+            "Not mapped",
+            msg="The diff function does not map 'not_mapped' and can be retrieved.",
+        )
+        self.assertEqual(
+            smm.history.latest().changes_display_dict["Product No."][1],
+            "ASD301301A6",
+            msg="The diff function maps 'sku' as 'Product No.' and can be retrieved.",
+        )
+        self.assertEqual(
+            smm.history.latest().changes_display_dict["Version"][1],
+            "2.1.5",
+            msg=(
+                "The diff function maps 'vtxt' as 'Version' through verbose_name"
+                " setting on the model field and can be retrieved."
+            ),
+        )
+        self.assertEqual(
+            smm.history.latest().changes_display_dict["not mapped"][1],
+            "Not mapped",
+            msg=(
+                "The diff function uses the django default verbose name for 'not_mapped'"
+                " and can be retrieved."
+            ),
+        )
+
 
 class SimpleMaskedFieldsModelTest(TestCase):
     """Log masked changes for fields in mask_fields"""
@@ -732,6 +862,21 @@ class SimpleMaskedFieldsModelTest(TestCase):
             smm.history.latest().changes_dict["address"][1],
             "*******ve data",
             msg="The diff function masks 'address' field.",
+        )
+
+    @override_settings(
+        AUDITLOG_MASK_CALLABLE="auditlog_tests.test_app.mask.custom_mask_str"
+    )
+    def test_global_mask_callable(self):
+        """Test that global mask_callable from settings is used when model-specific one is not provided"""
+        instance = SimpleMaskedModel.objects.create(
+            address="1234567890123456", text="Some text"
+        )
+
+        self.assertEqual(
+            instance.history.latest().changes_dict["address"][1],
+            "****3456",
+            msg="The global masking function should be used when model-specific one is not provided",
         )
 
 
@@ -1071,6 +1216,47 @@ class DateTimeFieldModelTest(TestCase):
         )
         dtm.save()
 
+    def test_datetime_field_functions_now(self):
+        timestamp = datetime.datetime(2017, 1, 10, 15, 0, tzinfo=timezone.utc)
+        date = datetime.date(2017, 1, 10)
+        time = datetime.time(12, 0)
+
+        dtm = DateTimeFieldModel(
+            label="DateTimeField model",
+            timestamp=timestamp,
+            date=date,
+            time=time,
+            naive_dt=Now(),
+        )
+        dtm.save()
+        dtm.naive_dt = Now()
+        self.assertEqual(dtm.naive_dt, Now())
+        dtm.save()
+
+        # Django 6.0+ evaluates expressions during save (django ticket #27222)
+        if DJANGO_VERSION >= (6, 0, 0):
+            with self.subTest("After save Django 6.0+"):
+                self.assertIsInstance(dtm.naive_dt, datetime.datetime)
+        else:
+            with self.subTest("After save Django < 6.0"):
+                self.assertEqual(dtm.naive_dt, Now())
+
+    def test_json_field_value_none(self):
+        json_model = NullableJSONModel(json=Value(None, JSONField()))
+        json_model.save()
+        self.assertEqual(json_model.history.count(), 1)
+        changes_dict = json_model.history.latest().changes_dict
+
+        # Django 6.0+ evaluates expressions during save (django ticket #27222)
+        if DJANGO_VERSION >= (6, 0, 0):
+            with self.subTest("Django 6.0+"):
+                # Value(None) gets evaluated to "null"
+                self.assertEqual(changes_dict["json"][1], "null")
+        else:
+            with self.subTest("Django < 6.0"):
+                # Value(None) is preserved as string representation
+                self.assertEqual(changes_dict["json"][1], "Value(None)")
+
 
 class UnregisterTest(TestCase):
     def setUp(self):
@@ -1150,15 +1336,12 @@ class RegisterModelSettingsTest(TestCase):
         # Exclude just one model
         self.assertTrue(
             SimpleExcludeModel
-            in self.test_auditlog._get_exclude_models(
-                ("auditlog_tests.SimpleExcludeModel",)
-            )
+            in self.test_auditlog._get_exclude_models(("test_app.SimpleExcludeModel",))
         )
 
         # Exclude all model of an app
         self.assertTrue(
-            SimpleExcludeModel
-            in self.test_auditlog._get_exclude_models(("auditlog_tests",))
+            SimpleExcludeModel in self.test_auditlog._get_exclude_models(("test_app",))
         )
 
     def test_register_models_no_models(self):
@@ -1167,23 +1350,23 @@ class RegisterModelSettingsTest(TestCase):
         self.assertEqual(self.test_auditlog._registry, {})
 
     def test_register_models_register_single_model(self):
-        self.test_auditlog._register_models(("auditlog_tests.SimpleExcludeModel",))
+        self.test_auditlog._register_models(("test_app.SimpleExcludeModel",))
 
         self.assertTrue(self.test_auditlog.contains(SimpleExcludeModel))
         self.assertEqual(len(self.test_auditlog._registry), 1)
 
     def test_register_models_register_app(self):
-        self.test_auditlog._register_models(("auditlog_tests",))
+        self.test_auditlog._register_models(("test_app",))
 
         self.assertTrue(self.test_auditlog.contains(SimpleExcludeModel))
         self.assertTrue(self.test_auditlog.contains(ChoicesFieldModel))
-        self.assertEqual(len(self.test_auditlog.get_models()), 25)
+        self.assertEqual(len(self.test_auditlog.get_models()), 36)
 
     def test_register_models_register_model_with_attrs(self):
         self.test_auditlog._register_models(
             (
                 {
-                    "model": "auditlog_tests.SimpleExcludeModel",
+                    "model": "test_app.SimpleExcludeModel",
                     "include_fields": ["label"],
                     "exclude_fields": [
                         "text",
@@ -1201,7 +1384,7 @@ class RegisterModelSettingsTest(TestCase):
         self.test_auditlog._register_models(
             (
                 {
-                    "model": "auditlog_tests.ManyRelatedModel",
+                    "model": "test_app.ManyRelatedModel",
                     "m2m_fields": {"related"},
                 },
             )
@@ -1250,6 +1433,24 @@ class RegisterModelSettingsTest(TestCase):
             with self.assertRaisesMessage(
                 ValueError,
                 "In order to use 'AUDITLOG_EXCLUDE_TRACKING_FIELDS', "
+                "setting 'AUDITLOG_INCLUDE_ALL_MODELS' must be set to 'True'",
+            ):
+                self.test_auditlog.register_from_settings()
+
+        with override_settings(
+            AUDITLOG_INCLUDE_ALL_MODELS=True,
+            AUDITLOG_MASK_TRACKING_FIELDS="badvalue",
+        ):
+            with self.assertRaisesMessage(
+                TypeError,
+                "Setting 'AUDITLOG_MASK_TRACKING_FIELDS' must be a list or tuple",
+            ):
+                self.test_auditlog.register_from_settings()
+
+        with override_settings(AUDITLOG_MASK_TRACKING_FIELDS=("token", "otp_secret")):
+            with self.assertRaisesMessage(
+                ValueError,
+                "In order to use 'AUDITLOG_MASK_TRACKING_FIELDS', "
                 "setting 'AUDITLOG_INCLUDE_ALL_MODELS' must be set to 'True'",
             ):
                 self.test_auditlog.register_from_settings()
@@ -1305,7 +1506,7 @@ class RegisterModelSettingsTest(TestCase):
 
     @override_settings(
         AUDITLOG_INCLUDE_ALL_MODELS=True,
-        AUDITLOG_EXCLUDE_TRACKING_MODELS=("auditlog_tests.SimpleExcludeModel",),
+        AUDITLOG_EXCLUDE_TRACKING_MODELS=("test_app.SimpleExcludeModel",),
     )
     def test_register_from_settings_register_all_models_with_exclude_models_tuple(self):
         self.test_auditlog.register_from_settings()
@@ -1333,7 +1534,25 @@ class RegisterModelSettingsTest(TestCase):
 
     @override_settings(
         AUDITLOG_INCLUDE_ALL_MODELS=True,
-        AUDITLOG_EXCLUDE_TRACKING_MODELS=["auditlog_tests.SimpleExcludeModel"],
+        AUDITLOG_MASK_TRACKING_FIELDS=("secret",),
+    )
+    def test_register_from_settings_register_all_models_with_mask_tracking_fields(
+        self,
+    ):
+        self.test_auditlog.register_from_settings()
+
+        self.assertEqual(
+            self.test_auditlog.get_model_fields(SimpleModel)["mask_fields"],
+            ["secret"],
+        )
+        self.assertEqual(
+            self.test_auditlog.get_model_fields(AltPrimaryKeyModel)["mask_fields"],
+            ["secret"],
+        )
+
+    @override_settings(
+        AUDITLOG_INCLUDE_ALL_MODELS=True,
+        AUDITLOG_EXCLUDE_TRACKING_MODELS=["test_app.SimpleExcludeModel"],
     )
     def test_register_from_settings_register_all_models_with_exclude_models_list(self):
         self.test_auditlog.register_from_settings()
@@ -1344,7 +1563,7 @@ class RegisterModelSettingsTest(TestCase):
     @override_settings(
         AUDITLOG_INCLUDE_TRACKING_MODELS=(
             {
-                "model": "auditlog_tests.SimpleExcludeModel",
+                "model": "test_app.SimpleExcludeModel",
                 "include_fields": ["label"],
                 "exclude_fields": [
                     "text",
@@ -1483,46 +1702,36 @@ class CharFieldTextFieldModelTest(TestCase):
             msg="The field should display the entire string because it is less than 140 characters",
         )
 
+    def test_changes_display_dict_longtextfield_to_be_truncated_at_custom_length(self):
+        with override_settings(AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH=10):
+            length = settings.AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH
+            self.assertEqual(
+                self.obj.history.latest().changes_display_dict["longtextfield"][1],
+                f"{self.PLACEHOLDER_LONGCHAR[:length]}...",
+                msg=f"The string should be truncated at {length} characters with an ellipsis at the end.",
+            )
 
-class PostgresArrayFieldModelTest(TestCase):
-    databases = "__all__"
+    def test_changes_display_dict_longtextfield_to_be_truncated_to_empty_string(self):
+        with override_settings(AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH=0):
+            length = settings.AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH
+            self.assertEqual(
+                self.obj.history.latest().changes_display_dict["longtextfield"][1],
+                "",
+                msg=f"The string should be empty as AUDITLOG_TRUNCATE_CHANGES_DISPLAY is set to {length}.",
+            )
 
-    def setUp(self):
-        self.obj = PostgresArrayFieldModel.objects.create(
-            arrayfield=[PostgresArrayFieldModel.RED, PostgresArrayFieldModel.GREEN],
-        )
-
-    @property
-    def latest_array_change(self):
-        return self.obj.history.latest().changes_display_dict["arrayfield"][1]
-
-    def test_changes_display_dict_arrayfield(self):
-        self.assertEqual(
-            self.latest_array_change,
-            "Red, Green",
-            msg="The human readable text for the two choices, 'Red, Green' is displayed.",
-        )
-        self.obj.arrayfield = [PostgresArrayFieldModel.GREEN]
-        self.obj.save()
-        self.assertEqual(
-            self.latest_array_change,
-            "Green",
-            msg="The human readable text 'Green' is displayed.",
-        )
-        self.obj.arrayfield = []
-        self.obj.save()
-        self.assertEqual(
-            self.latest_array_change,
-            "",
-            msg="The human readable text '' is displayed.",
-        )
-        self.obj.arrayfield = [PostgresArrayFieldModel.GREEN]
-        self.obj.save()
-        self.assertEqual(
-            self.latest_array_change,
-            "Green",
-            msg="The human readable text 'Green' is displayed.",
-        )
+    def test_changes_display_dict_longtextfield_with_truncation_disabled(self):
+        with override_settings(AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH=-1):
+            length = settings.AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH
+            self.assertEqual(
+                self.obj.history.latest().changes_display_dict["longtextfield"][1],
+                self.PLACEHOLDER_LONGTEXTFIELD,
+                msg=(
+                    "The field should display the entire string "
+                    f"even though it is longer than {length} characters"
+                    "as AUDITLOG_TRUNCATE_CHANGES_DISPLAY is set to a negative number"
+                ),
+            )
 
 
 class AdminPanelTest(TestCase):
@@ -1555,7 +1764,7 @@ class AdminPanelTest(TestCase):
         for tz, timestamp in [
             ("UTC", "2022-08-01 12:00:00"),
             ("Asia/Tbilisi", "2022-08-01 16:00:00"),
-            ("America/Buenos_Aires", "2022-08-01 09:00:00"),
+            ("America/Argentina/Buenos_Aires", "2022-08-01 09:00:00"),
             ("Asia/Kathmandu", "2022-08-01 17:45:00"),
         ]:
             with self.settings(TIME_ZONE=tz):
@@ -1943,6 +2152,33 @@ class ModelInstanceDiffTest(TestCase):
             changes,
             {"boolean": ("True", "False")},
             msg="ObjectDoesNotExist should be handled",
+        )
+
+    def test_field_with_no_default_provided(self):
+        """Field with no default (NOT_PROVIDED) should return None."""
+        first = SimpleModel(integer=1)
+        second = SimpleModel()
+
+        delattr(second, "integer")
+
+        changes = model_instance_diff(first, second)
+        self.assertEqual(
+            changes,
+            {"integer": ("1", "None")},
+            msg="field with no default should return None",
+        )
+
+    def test_field_with_callable_default(self):
+        first = SimpleModel(char="value")
+        second = SimpleModel()
+
+        delattr(second, "char")
+
+        changes = model_instance_diff(first, second)
+        self.assertEqual(
+            changes,
+            {"char": ("value", "default value")},
+            msg="callable default should be handled",
         )
 
     def test_diff_models_with_json_fields(self):
@@ -2647,7 +2883,9 @@ class DisableTest(TestCase):
         This only works with context manager
         """
         with disable_auditlog():
-            management.call_command("loaddata", "m2m_test_fixture.json", verbosity=0)
+            management.call_command(
+                "loaddata", "test_app/fixtures/m2m_test_fixture.json", verbosity=0
+            )
         recursive = ManyRelatedModel.objects.get(pk=1)
         self.assertEqual(0, LogEntry.objects.get_for_object(recursive).count())
         related = ManyRelatedOtherModel.objects.get(pk=1)
@@ -2668,3 +2906,217 @@ class MissingModelTest(TestCase):
         history = self.obj.history.latest()
         self.assertEqual(history.changes_dict["text"][1], self.obj.text)
         self.assertEqual(history.changes_display_dict["text"][1], self.obj.text)
+
+
+class ModelManagerTest(TestCase):
+    """
+    This does not directly assert the configured manager, but its behaviour.
+    The "secret" object should not be accessible, as the queryset is overridden.
+    """
+
+    def setUp(self):
+        self.secret = SwappedManagerModel.objects.create(is_secret=True, name="Secret")
+        self.public = SwappedManagerModel.objects.create(is_secret=False, name="Public")
+
+    def test_update_secret(self):
+        self.secret.name = "Updated"
+        self.secret.save()
+        log = LogEntry.objects.get_for_object(self.secret).first()
+        self.assertEqual(log.action, LogEntry.Action.UPDATE)
+        self.assertEqual(log.changes_dict["name"], ["None", "Updated"])
+
+    def test_update_public(self):
+        self.public.name = "Updated"
+        self.public.save()
+        log = LogEntry.objects.get_for_object(self.public).first()
+        self.assertEqual(log.action, LogEntry.Action.UPDATE)
+        self.assertEqual(log.changes_dict["name"], ["Public", "Updated"])
+
+
+class BaseManagerSettingTest(TestCase):
+    """
+    If the AUDITLOG_USE_BASE_MANAGER setting is enabled, "secret" objects
+    should be audited as if they were public, with full access to field
+    values.
+    """
+
+    def test_use_base_manager_setting_update(self):
+        """
+        Model update. The default False case is covered by test_update_secret.
+        """
+        secret = SwappedManagerModel.objects.create(is_secret=True, name="Secret")
+        with override_settings(AUDITLOG_USE_BASE_MANAGER=True):
+            secret.name = "Updated"
+            secret.save()
+            log = LogEntry.objects.get_for_object(secret).first()
+            self.assertEqual(log.action, LogEntry.Action.UPDATE)
+            self.assertEqual(log.changes_dict["name"], ["Secret", "Updated"])
+
+    def test_use_base_manager_setting_related_model(self):
+        """
+        When AUDITLOG_USE_BASE_MANAGER is enabled, related model changes that
+        are normally invisible to the default model manager should remain
+        visible and not refer to "deleted" objects.
+        """
+        t1 = datetime.datetime(2025, 1, 1, 12, tzinfo=datetime.timezone.utc)
+        with (
+            override_settings(AUDITLOG_USE_BASE_MANAGER=False),
+            freezegun.freeze_time(t1),
+        ):
+            public_one = SwappedManagerModel.objects.create(name="Public One")
+            secret_one = SwappedManagerModel.objects.create(
+                is_secret=True, name="Secret One"
+            )
+            instance_one = SecretRelatedModel.objects.create(
+                one_to_one=public_one,
+                related=secret_one,
+            )
+
+            log_one = instance_one.history.filter(timestamp=t1).first()
+            self.assertIsInstance(log_one, LogEntry)
+            display_dict = log_one.changes_display_dict
+            self.assertEqual(display_dict["related"][0], "None")
+            self.assertEqual(
+                display_dict["related"][1],
+                f"Deleted 'SwappedManagerModel' ({secret_one.id})",
+                "Default manager should have no visibility of secret object",
+            )
+            self.assertEqual(display_dict["one to one"][0], "None")
+            self.assertEqual(display_dict["one to one"][1], "Public One")
+
+        t2 = t1 + datetime.timedelta(days=20)
+        with (
+            override_settings(AUDITLOG_USE_BASE_MANAGER=True),
+            freezegun.freeze_time(t2),
+        ):
+            public_two = SwappedManagerModel.objects.create(name="Public Two")
+            secret_two = SwappedManagerModel.objects.create(
+                is_secret=True, name="Secret Two"
+            )
+            instance_two = SecretRelatedModel.objects.create(
+                one_to_one=public_two,
+                related=secret_two,
+            )
+
+            log_two = instance_two.history.filter(timestamp=t2).first()
+            self.assertIsInstance(log_two, LogEntry)
+            display_dict = log_two.changes_display_dict
+            self.assertEqual(display_dict["related"][0], "None")
+            self.assertEqual(
+                display_dict["related"][1],
+                "Secret Two",
+                "Base manager should have full visibility of secret object",
+            )
+            self.assertEqual(display_dict["one to one"][0], "None")
+            self.assertEqual(display_dict["one to one"][1], "Public Two")
+
+    def test_use_base_manager_setting_changes(self):
+        """
+        When AUDITLOG_USE_BASE_MANAGER is enabled, registered many-to-many model
+        changes that refer to an object hidden from the default model manager
+        should remain visible and be logged.
+        """
+        with override_settings(AUDITLOG_USE_BASE_MANAGER=False):
+            obj_one = SwappedManagerModel.objects.create(
+                is_secret=True, name="Secret One"
+            )
+            m2m_one = SecretM2MModel.objects.create(name="M2M One")
+            m2m_one.m2m_related.add(obj_one)
+
+        self.assertIn(m2m_one, obj_one.m2m_related.all(), "Secret One sees M2M One")
+        self.assertNotIn(
+            obj_one, m2m_one.m2m_related.all(), "M2M One cannot see Secret One"
+        )
+        self.assertEqual(
+            0,
+            LogEntry.objects.get_for_object(m2m_one).count(),
+            "No update with default manager",
+        )
+
+        with override_settings(AUDITLOG_USE_BASE_MANAGER=True):
+            obj_two = SwappedManagerModel.objects.create(
+                is_secret=True, name="Secret Two"
+            )
+            m2m_two = SecretM2MModel.objects.create(name="M2M Two")
+            m2m_two.m2m_related.add(obj_two)
+
+        self.assertIn(m2m_two, obj_two.m2m_related.all(), "Secret Two sees M2M Two")
+        self.assertNotIn(
+            obj_two, m2m_two.m2m_related.all(), "M2M Two cannot see Secret Two"
+        )
+        self.assertEqual(
+            1,
+            LogEntry.objects.get_for_object(m2m_two).count(),
+            "Update logged with base manager",
+        )
+
+        log_entry = LogEntry.objects.get_for_object(m2m_two).first()
+        self.assertEqual(
+            log_entry.changes,
+            {
+                "m2m_related": {
+                    "type": "m2m",
+                    "operation": "add",
+                    "objects": [smart_str(obj_two)],
+                }
+            },
+        )
+
+
+class TestMaskStr(TestCase):
+    """Test the mask_str function that masks sensitive data."""
+
+    def test_mask_str_empty(self):
+        self.assertEqual(mask_str(""), "")
+
+    def test_mask_str_single_char(self):
+        self.assertEqual(mask_str("a"), "a")
+
+    def test_mask_str_even_length(self):
+        self.assertEqual(mask_str("1234"), "**34")
+
+    def test_mask_str_odd_length(self):
+        self.assertEqual(mask_str("12345"), "**345")
+
+    def test_mask_str_long_text(self):
+        self.assertEqual(mask_str("confidential"), "******ential")
+
+
+class CustomMaskModelTest(TestCase):
+    def test_custom_mask_function(self):
+        instance = CustomMaskModel.objects.create(
+            credit_card="1234567890123456", text="Some text"
+        )
+        self.assertEqual(
+            instance.history.latest().changes_dict["credit_card"][1],
+            "****3456",
+            msg="The custom masking function should mask all but last 4 digits",
+        )
+
+    def test_custom_mask_function_short_value(self):
+        """Test that custom masking function handles short values correctly"""
+        instance = CustomMaskModel.objects.create(credit_card="123", text="Some text")
+        self.assertEqual(
+            instance.history.latest().changes_dict["credit_card"][1],
+            "123",
+            msg="The custom masking function should not mask values shorter than 4 characters",
+        )
+
+    def test_custom_mask_function_serialized_data(self):
+        instance = CustomMaskModel.objects.create(
+            credit_card="1234567890123456", text="Some text"
+        )
+        log = instance.history.latest()
+        self.assertTrue(isinstance(log, LogEntry))
+        self.assertEqual(log.action, LogEntry.Action.CREATE)
+
+        # Update to trigger serialization
+        instance.credit_card = "9876543210987654"
+        instance.save()
+
+        log = instance.history.latest()
+        self.assertEqual(
+            log.changes_dict["credit_card"][1],
+            "****7654",
+            msg="The custom masking function should be used in serialized data",
+        )

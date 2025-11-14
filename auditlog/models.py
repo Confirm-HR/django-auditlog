@@ -1,9 +1,10 @@
 import ast
 import contextlib
 import json
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import timezone
-from typing import Any, Callable, Dict, List, Union
+from typing import Any
 
 from dateutil import parser
 from dateutil.tz import gettz
@@ -23,7 +24,7 @@ from django.utils import timezone as django_timezone
 from django.utils.encoding import smart_str
 from django.utils.translation import gettext_lazy as _
 
-from auditlog.diff import mask_str
+from auditlog.diff import get_mask_function
 
 DEFAULT_OBJECT_REPR = "<error forming object repr>"
 
@@ -215,12 +216,13 @@ class LogEntryManager(models.Manager):
         :type instance: Model
         :return: The primary key value of the given model instance.
         """
-        pk_field = instance._meta.pk.name
+        # Should be equivalent to `instance.pk`.
+        pk_field = instance._meta.pk.attname
         pk = getattr(instance, pk_field, None)
 
         # Check to make sure that we got a pk not a model object.
-        if isinstance(pk, models.Model):
-            pk = self._get_pk_value(pk)
+        # Should be guaranteed as we used `attname` above, not `name`.
+        assert not isinstance(pk, models.Model)
         return pk
 
     def _get_serialized_data_or_none(self, instance):
@@ -251,7 +253,7 @@ class LogEntryManager(models.Manager):
 
         mask_fields = model_fields["mask_fields"]
         if mask_fields:
-            data = self._mask_serialized_fields(data, mask_fields)
+            data = self._mask_serialized_fields(data, mask_fields, model_fields)
 
         return data
 
@@ -279,8 +281,8 @@ class LogEntryManager(models.Manager):
         return instance_copy
 
     def _get_applicable_model_fields(
-        self, instance, model_fields: Dict[str, List[str]]
-    ) -> List[str]:
+        self, instance, model_fields: dict[str, list[str]]
+    ) -> list[str]:
         include_fields = model_fields["include_fields"]
         exclude_fields = model_fields["exclude_fields"]
         all_field_names = [field.name for field in instance._meta.fields]
@@ -293,14 +295,15 @@ class LogEntryManager(models.Manager):
         )
 
     def _mask_serialized_fields(
-        self, data: Dict[str, Any], mask_fields: List[str]
-    ) -> Dict[str, Any]:
+        self, data: dict[str, Any], mask_fields: list[str], model_fields: dict[str, Any]
+    ) -> dict[str, Any]:
         all_field_data = data.pop("fields")
+        mask_func = get_mask_function(model_fields.get("mask_callable"))
 
         masked_field_data = {}
         for key, value in all_field_data.items():
             if isinstance(value, str) and key in mask_fields:
-                masked_field_data[key] = mask_str(value)
+                masked_field_data[key] = mask_func(value)
             else:
                 masked_field_data[key] = value
 
@@ -381,6 +384,9 @@ class LogEntry(models.Model):
     remote_addr = models.GenericIPAddressField(
         blank=True, null=True, verbose_name=_("remote address")
     )
+    remote_port = models.PositiveIntegerField(
+        blank=True, null=True, verbose_name=_("remote port")
+    )
     timestamp = models.DateTimeField(
         default=django_timezone.now,
         db_index=True,
@@ -388,6 +394,9 @@ class LogEntry(models.Model):
     )
     additional_data = models.JSONField(
         blank=True, null=True, verbose_name=_("additional data")
+    )
+    actor_email = models.CharField(
+        blank=True, null=True, max_length=254, verbose_name=_("actor email")
     )
 
     objects = LogEntryManager()
@@ -459,9 +468,17 @@ class LogEntry(models.Model):
         if auditlog.contains(model._meta.model):
             model_fields = auditlog.get_model_fields(model._meta.model)
 
+        if settings.AUDITLOG_STORE_JSON_CHANGES:
+            changes_dict = {}
+            for field_name, values in self.changes_dict.items():
+                values_as_strings = [str(v) for v in values]
+                changes_dict[field_name] = values_as_strings
+        else:
+            changes_dict = self.changes_dict
+
         changes_display_dict = {}
         # grab the changes_dict and iterate through
-        for field_name, values in self.changes_dict.items():
+        for field_name, values in changes_dict.items():
             # try to get the field attribute on the model
             try:
                 field = model._meta.get_field(field_name)
@@ -527,9 +544,9 @@ class LogEntry(models.Model):
                             field, value
                         )
 
-                    # check if length is longer than 140 and truncate with ellipsis
-                    if len(value) > 140:
-                        value = f"{value[:140]}..."
+                    truncate_at = settings.AUDITLOG_CHANGE_DISPLAY_TRUNCATE_LENGTH
+                    if 0 <= truncate_at < len(value):
+                        value = value[:truncate_at] + ("..." if truncate_at > 0 else "")
 
                     values_display.append(value)
 
@@ -543,7 +560,7 @@ class LogEntry(models.Model):
         return changes_display_dict
 
     def _get_changes_display_for_fk_field(
-        self, field: Union[models.ForeignKey, models.OneToOneField], value: Any
+        self, field: models.ForeignKey | models.OneToOneField, value: Any
     ) -> str:
         """
         :return: A string representing a given FK value and the field to which it belongs
@@ -562,7 +579,9 @@ class LogEntry(models.Model):
             return value
         # Attempt to return the string representation of the object
         try:
-            return smart_str(field.related_model.objects.get(pk=pk_value))
+            related_model_manager = _get_manager_from_settings(field.related_model)
+
+            return smart_str(related_model_manager.get(pk=pk_value))
         # ObjectDoesNotExist will be raised if the object was deleted.
         except ObjectDoesNotExist:
             return f"Deleted '{field.related_model.__name__}' ({value})"
@@ -616,8 +635,8 @@ class AuditlogHistoryField(GenericRelation):
 changes_func = None
 
 
-def _changes_func() -> Callable[[LogEntry], Dict]:
-    def json_then_text(instance: LogEntry) -> Dict:
+def _changes_func() -> Callable[[LogEntry], dict]:
+    def json_then_text(instance: LogEntry) -> dict:
         if instance.changes:
             return instance.changes
         elif instance.changes_text:
@@ -625,9 +644,22 @@ def _changes_func() -> Callable[[LogEntry], Dict]:
                 return json.loads(instance.changes_text)
         return {}
 
-    def default(instance: LogEntry) -> Dict:
+    def default(instance: LogEntry) -> dict:
         return instance.changes or {}
 
     if settings.AUDITLOG_USE_TEXT_CHANGES_IF_JSON_IS_NOT_PRESENT:
         return json_then_text
     return default
+
+
+def _get_manager_from_settings(model: type[models.Model]) -> models.Manager:
+    """
+    Get model manager as selected by AUDITLOG_USE_BASE_MANAGER.
+
+    - True: return model._meta.base_manager
+    - False: return model._meta.default_manager
+    """
+    if settings.AUDITLOG_USE_BASE_MANAGER:
+        return model._meta.base_manager
+    else:
+        return model._meta.default_manager
