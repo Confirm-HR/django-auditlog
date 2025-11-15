@@ -7,14 +7,38 @@ from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import BooleanField, Q, TextField, Value
+from django.db.models import BooleanField, Lookup, Q, TextField, Value
 from django.db.models.expressions import RawSQL
+from django.db.models.fields import CharField, TextField as TextFieldModel
 from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 
 from auditlog.filters import CIDFilter, ResourceTypeFilter
 from auditlog.mixins import LogEntryAdminMixin
 from auditlog.models import LogEntry
+
+
+# Custom lookup that generates plain ILIKE without UPPER() transformation
+# ILIKE is already case-insensitive, UPPER() is redundant and prevents trigram index usage
+@CharField.register_lookup
+@TextFieldModel.register_lookup
+class PlainIContains(Lookup):
+    """
+    Generates: field ILIKE '%pattern%'
+    Instead of: UPPER(field::text) LIKE UPPER('%pattern%')
+
+    ILIKE is already case-insensitive. UPPER() prevents GIN trigram index usage.
+    """
+    lookup_name = 'plain_icontains'
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        params = lhs_params + rhs_params
+        # Add % wildcards for ILIKE pattern matching
+        params = params[:-1] + ('%%%s%%' % rhs_params[0],)
+        return '%s ILIKE %%s' % lhs, params
+
 
 STRUCTURED_SEARCH_PATTERN = re.compile(
     r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
@@ -135,15 +159,16 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             user_model = get_user_model()
             username_field = user_model.USERNAME_FIELD
 
-            # For EXACT substring matching (emails, names, departments), use icontains
-            # The GIN trigram indices from migrations 0019 & 0020 accelerate ILIKE queries
-            # This finds exact occurrences, not fuzzy matches
+            # For EXACT substring matching (emails, names, departments), use plain_icontains
+            # This generates plain ILIKE without UPPER() transformation
+            # ILIKE is already case-insensitive; UPPER() prevents trigram index usage
+            # GIN trigram indices from migrations 0019 & 0020 accelerate plain ILIKE queries
             queryset = queryset.filter(
-                Q(object_repr__icontains=search_term) |
-                Q(changes__icontains=search_term) |
-                Q(actor__first_name__icontains=search_term) |
-                Q(actor__last_name__icontains=search_term) |
-                Q(**{f"actor__{username_field}__icontains": search_term})
+                Q(object_repr__plain_icontains=search_term) |
+                Q(changes__plain_icontains=search_term) |
+                Q(actor__first_name__plain_icontains=search_term) |
+                Q(actor__last_name__plain_icontains=search_term) |
+                Q(**{f"actor__{username_field}__plain_icontains": search_term})
             ).annotate(
                 object_repr_similarity=TrigramSimilarity("object_repr", search_term),
                 changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
