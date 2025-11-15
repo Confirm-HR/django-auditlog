@@ -122,20 +122,34 @@ def perform_trigram_search(queryset, search_term):
     # ILIKE is already case-insensitive; UPPER() prevents trigram index usage
     # GIN trigram indices from migrations 0019 & 0020 accelerate plain ILIKE queries
 
-    # For JSONField (changes), we need to cast to text first
-    # Use RawSQL to ensure proper casting for trigram index usage
+    # Use UNION instead of OR to allow index usage on each part separately
+    # OR across JOIN prevents index usage; UNION allows each query to use its indices
+
     from django.db.models import BooleanField
     from django.db.models.expressions import RawSQL
 
-    queryset = queryset.filter(
+    # Query 1: Search in LogEntry fields (object_repr, changes)
+    # Add similarity annotations first so UNION has matching columns
+    logentry_q = queryset.filter(
         Q(object_repr__plain_icontains=search_term) |
-        Q(RawSQL("(changes)::text ILIKE %s", (f'%{search_term}%',), output_field=BooleanField())) |
+        Q(RawSQL("(changes)::text ILIKE %s", (f'%{search_term}%',), output_field=BooleanField()))
+    ).annotate(
+        object_repr_similarity=TrigramSimilarity("object_repr", search_term),
+        changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
+    )
+
+    # Query 2: Search in actor fields (requires join)
+    # Add same similarity annotations to match Query 1 columns
+    actor_q = queryset.filter(
         Q(actor__first_name__plain_icontains=search_term) |
         Q(actor__last_name__plain_icontains=search_term) |
         Q(**{f"actor__{username_field}__plain_icontains": search_term})
     ).annotate(
         object_repr_similarity=TrigramSimilarity("object_repr", search_term),
         changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
-    ).order_by("-object_repr_similarity", "-changes_similarity")
+    )
 
-    return queryset.distinct(), False  # False = don't use additional distinct()
+    # Combine with UNION (| operator on querysets) - both have same columns now
+    combined_q = (logentry_q | actor_q).order_by("-object_repr_similarity", "-changes_similarity")
+
+    return combined_q.distinct(), False  # False = don't use additional distinct()
