@@ -12,6 +12,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.contrib.postgres.search import TrigramSimilarity
 from django.db.models import Lookup, Q, TextField
 from django.db.models.fields import CharField, TextField as TextFieldModel
+from django.db.models.lookups import PatternLookup
 from django.db.models.functions import Cast
 
 
@@ -19,25 +20,23 @@ from django.db.models.functions import Cast
 # ILIKE is already case-insensitive, UPPER() is redundant and prevents trigram index usage
 @CharField.register_lookup
 @TextFieldModel.register_lookup
-class PlainIContains(Lookup):
+class PlainIContains(PatternLookup):
     """
     Generates: field ILIKE '%pattern%'
     Instead of: UPPER(field::text) LIKE UPPER('%pattern%')
 
     ILIKE is already case-insensitive. UPPER() prevents GIN trigram index usage.
+    Inherits from PatternLookup to properly handle wildcard pattern preparation.
     """
     lookup_name = 'plain_icontains'
+    param_pattern = '%%%s%%'  # Wrap with wildcards for ILIKE
 
     def as_sql(self, compiler, connection):
         lhs, lhs_params = self.process_lhs(compiler, connection)
         rhs, rhs_params = self.process_rhs(compiler, connection)
-        # Convert to lists to ensure concatenation works
-        params = list(lhs_params) + list(rhs_params)
-        # Wrap the search term with % wildcards for pattern matching
-        # The last param is the search term from the user
-        if params:
-            params[-1] = f'%{params[-1]}%'
-        return f'{lhs} ILIKE %s', params
+        params = lhs_params + rhs_params
+        # Generate plain ILIKE without UPPER() transformation
+        return f'{lhs} ILIKE {rhs}', params
 
 
 # Structured search pattern: ModelName:ID
