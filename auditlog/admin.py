@@ -34,9 +34,10 @@ class PlainIContains(Lookup):
     def as_sql(self, compiler, connection):
         lhs, lhs_params = self.process_lhs(compiler, connection)
         rhs, rhs_params = self.process_rhs(compiler, connection)
-        params = lhs_params + rhs_params
+        # Convert to lists to ensure concatenation works
+        params = list(lhs_params) + list(rhs_params)
         # Add % wildcards for ILIKE pattern matching
-        params = params[:-1] + ('%%%s%%' % rhs_params[0],)
+        params[-1] = '%%%s%%' % params[-1]
         return '%s ILIKE %%s' % lhs, params
 
 
