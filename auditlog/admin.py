@@ -1,49 +1,13 @@
-import re
 from functools import cached_property
 
-from django.apps import apps
 from django.contrib import admin
-from django.contrib.auth import get_user_model
-from django.contrib.contenttypes.models import ContentType
-from django.contrib.postgres.search import TrigramSimilarity
 from django.core.exceptions import ObjectDoesNotExist
-from django.db.models import BooleanField, Lookup, Q, TextField, Value
-from django.db.models.expressions import RawSQL
-from django.db.models.fields import CharField, TextField as TextFieldModel
-from django.db.models.functions import Cast
 from django.utils.translation import gettext_lazy as _
 
+from auditlog.confirm_customizations import perform_structured_search, perform_trigram_search
 from auditlog.filters import CIDFilter, ResourceTypeFilter
 from auditlog.mixins import LogEntryAdminMixin
 from auditlog.models import LogEntry
-
-
-# Custom lookup that generates plain ILIKE without UPPER() transformation
-# ILIKE is already case-insensitive, UPPER() is redundant and prevents trigram index usage
-@CharField.register_lookup
-@TextFieldModel.register_lookup
-class PlainIContains(Lookup):
-    """
-    Generates: field ILIKE '%pattern%'
-    Instead of: UPPER(field::text) LIKE UPPER('%pattern%')
-
-    ILIKE is already case-insensitive. UPPER() prevents GIN trigram index usage.
-    """
-    lookup_name = 'plain_icontains'
-
-    def as_sql(self, compiler, connection):
-        lhs, lhs_params = self.process_lhs(compiler, connection)
-        rhs, rhs_params = self.process_rhs(compiler, connection)
-        # Convert to lists to ensure concatenation works
-        params = list(lhs_params) + list(rhs_params)
-        # Add % wildcards for ILIKE pattern matching
-        params[-1] = '%%%s%%' % params[-1]
-        return '%s ILIKE %%s' % lhs, params
-
-
-STRUCTURED_SEARCH_PATTERN = re.compile(
-    r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
-)
 
 
 @admin.register(LogEntry)
@@ -99,83 +63,21 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         """
         Override Django admin search to:
         1. Handle structured search (ModelName:ID) - uses content_type/object_id indices
-        2. Use trigram % operator for free-text filtering - uses GIN indices
+        2. Use plain ILIKE for free-text filtering - uses GIN trigram indices
         3. Use TrigramSimilarity for ranking results by relevance
         """
-        # Check for structured search pattern first
+        # Check for structured search pattern first (ModelName:ID)
         if search_term:
-            match = STRUCTURED_SEARCH_PATTERN.match(search_term)
-            if match:
-                # Structured search logic (same as before)
-                try:
-                    model_name = match.group("model_name")
-                    object_id = int(match.group("id"))
+            result = perform_structured_search(
+                request, queryset, search_term, self.message_user
+            )
+            if result is not None:
+                return result
 
-                    try:
-                        try:
-                            model = apps.get_model(
-                                app_label="api", model_name=model_name
-                            )
-                        except LookupError:
-                            if model_name.lower() in ["user", "customuser"]:
-                                model = get_user_model()
-                            else:
-                                raise
-                    except LookupError:
-                        self.message_user(
-                            request,
-                            f"Model '{model_name}' does not exist.",
-                            level="warning",
-                        )
-                        return queryset.none(), False
-
-                    # Filter using indexed fields
-                    content_type = ContentType.objects.get_for_model(model)
-                    queryset = queryset.filter(
-                        content_type=content_type, object_id=object_id
-                    )
-                    return queryset, False  # False = don't use distinct()
-
-                except (ValueError, TypeError):
-                    self.message_user(
-                        request,
-                        "Structured search format must be 'ModelName:id'.",
-                        level="warning",
-                    )
-                    return queryset.none(), False
-
-        # Use trigram similarity for free-text search (uses GIN indices from migration 0019)
+        # Use trigram similarity for free-text search (uses GIN indices from migrations 0019 & 0020)
         # Requires minimum 3 characters for meaningful trigram matching
         if search_term and len(search_term) >= 3:
-            # CRITICAL: Use the % operator via RawSQL for filtering to ensure index usage
-            # Then use TrigramSimilarity for ranking/ordering
-            # The % operator WILL use the GIN index, while similarity() function alone may not
-
-            # Filter using % operator (uses GIN indices) for ALL fields
-            # Using RawSQL for proper parameter binding with .annotate()
-            # IMPORTANT: Combine all filters BEFORE annotating to avoid SQL errors from mismatched columns
-
-            # Build query using mix of RawSQL and Django ORM trigram lookups
-            # Migration 0020 adds trigram indices on User model fields (first_name, last_name, username)
-            user_model = get_user_model()
-            username_field = user_model.USERNAME_FIELD
-
-            # For EXACT substring matching (emails, names, departments), use plain_icontains
-            # This generates plain ILIKE without UPPER() transformation
-            # ILIKE is already case-insensitive; UPPER() prevents trigram index usage
-            # GIN trigram indices from migrations 0019 & 0020 accelerate plain ILIKE queries
-            queryset = queryset.filter(
-                Q(object_repr__plain_icontains=search_term) |
-                Q(changes__plain_icontains=search_term) |
-                Q(actor__first_name__plain_icontains=search_term) |
-                Q(actor__last_name__plain_icontains=search_term) |
-                Q(**{f"actor__{username_field}__plain_icontains": search_term})
-            ).annotate(
-                object_repr_similarity=TrigramSimilarity("object_repr", search_term),
-                changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
-            ).order_by("-object_repr_similarity", "-changes_similarity")
-
-            return queryset.distinct(), False  # False = don't use additional distinct()
+            return perform_trigram_search(queryset, search_term)
 
         # For very short searches (< 3 chars), return no results with a helpful message
         # Trigram matching is ineffective on very short strings
