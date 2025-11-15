@@ -149,7 +149,8 @@ def perform_trigram_search(queryset, search_term):
         changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
     )
 
-    # Combine with UNION (| operator on querysets) - both have same columns now
-    combined_q = (logentry_q | actor_q).order_by("-object_repr_similarity", "-changes_similarity")
+    # Combine with UNION - use .union() method to generate SQL UNION
+    # The | operator doesn't create UNION when both querysets are from same model
+    combined_q = logentry_q.union(actor_q).order_by("-object_repr_similarity", "-changes_similarity")
 
-    return combined_q.distinct(), False  # False = don't use additional distinct()
+    return combined_q, False  # False = don't use additional distinct()
