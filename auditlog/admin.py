@@ -131,10 +131,9 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             # Using RawSQL for proper parameter binding with .annotate()
             # IMPORTANT: Combine all filters BEFORE annotating to avoid SQL errors from mismatched columns
 
-            # Build SQL that uses % operator for trigram matching on all indexed fields
+            # Build query using mix of RawSQL and Django ORM trigram lookups
             # Migration 0020 adds trigram indices on User model fields (first_name, last_name, username)
             user_model = get_user_model()
-            user_table = user_model._meta.db_table
             username_field = user_model.USERNAME_FIELD
 
             # Set custom similarity threshold (0.03 for broader matching)
@@ -145,41 +144,22 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             with connection.cursor() as cursor:
                 cursor.execute("SET pg_trgm.similarity_threshold = 0.03")
 
-            # Ensure actor table is joined before RawSQL filter
-            queryset = queryset.select_related('actor')
-
-            queryset = (
-                queryset.filter(
-                    RawSQL(
-                        """
-                    (auditlog_logentry.object_repr %% %s) OR
-                    ((auditlog_logentry.changes)::text %% %s) OR
-                    ({user_table}.first_name %% %s) OR
-                    ({user_table}.last_name %% %s) OR
-                    ({user_table}.{username_field} %% %s)
-                    """.format(
-                            user_table=user_table, username_field=username_field
-                        ),
-                        (
-                            search_term,
-                            search_term,
-                            search_term,
-                            search_term,
-                            search_term,
-                        ),
-                        output_field=BooleanField(),
-                    )
-                )
-                .annotate(
-                    object_repr_similarity=TrigramSimilarity(
-                        "object_repr", search_term
-                    ),
-                    changes_similarity=TrigramSimilarity(
-                        Cast("changes", TextField()), search_term
-                    ),
-                )
-                .order_by("-object_repr_similarity", "-changes_similarity")
-            )
+            # Use RawSQL only for LogEntry table fields (object_repr, changes)
+            # For actor fields, use Django ORM Q objects - can't use RawSQL because
+            # select_related creates table aliases that we can't reference by name
+            queryset = queryset.filter(
+                Q(RawSQL(
+                    "(auditlog_logentry.object_repr %% %s) OR ((auditlog_logentry.changes)::text %% %s)",
+                    (search_term, search_term),
+                    output_field=BooleanField()
+                )) |
+                Q(actor__first_name__trigram_similar=search_term) |
+                Q(actor__last_name__trigram_similar=search_term) |
+                Q(**{f"actor__{username_field}__trigram_similar": search_term})
+            ).annotate(
+                object_repr_similarity=TrigramSimilarity("object_repr", search_term),
+                changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
+            ).order_by("-object_repr_similarity", "-changes_similarity")
 
             return queryset.distinct(), False  # False = don't use additional distinct()
 
