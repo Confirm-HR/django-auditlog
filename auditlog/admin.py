@@ -1,6 +1,7 @@
 from functools import cached_property
 
 from django.contrib import admin
+from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils.translation import gettext_lazy as _
 
