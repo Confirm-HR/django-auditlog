@@ -121,9 +121,15 @@ def perform_trigram_search(queryset, search_term):
     # This generates plain ILIKE without UPPER() transformation
     # ILIKE is already case-insensitive; UPPER() prevents trigram index usage
     # GIN trigram indices from migrations 0019 & 0020 accelerate plain ILIKE queries
+
+    # For JSONField (changes), we need to cast to text first
+    # Use RawSQL to ensure proper casting for trigram index usage
+    from django.db.models import BooleanField
+    from django.db.models.expressions import RawSQL
+
     queryset = queryset.filter(
         Q(object_repr__plain_icontains=search_term) |
-        Q(changes__plain_icontains=search_term) |
+        Q(RawSQL("(changes)::text ILIKE %s", (f'%{search_term}%',), output_field=BooleanField())) |
         Q(actor__first_name__plain_icontains=search_term) |
         Q(actor__last_name__plain_icontains=search_term) |
         Q(**{f"actor__{username_field}__plain_icontains": search_term})
