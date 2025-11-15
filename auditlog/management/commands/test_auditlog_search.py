@@ -91,8 +91,8 @@ class Command(BaseCommand):
 
             queryset, use_distinct = perform_trigram_search(queryset, search_term)
 
-        # Show query SQL
-        self.stdout.write(self.style.WARNING("\nGenerated SQL:"))
+        # Show query SQL (template - parameters not shown)
+        self.stdout.write(self.style.WARNING("\nGenerated SQL (template):"))
         self.stdout.write(str(queryset.query))
         self.stdout.write("")
 
@@ -100,8 +100,9 @@ class Command(BaseCommand):
         if explain:
             self.stdout.write(self.style.WARNING("\nEXPLAIN ANALYZE:"))
             with connection.cursor() as cursor:
-                sql = str(queryset.query)
-                cursor.execute(f"EXPLAIN ANALYZE {sql}")
+                # Get the actual SQL with parameters from the queryset
+                sql, params = queryset.query.sql_with_params()
+                cursor.execute(f"EXPLAIN ANALYZE {sql}", params)
                 for row in cursor.fetchall():
                     self.stdout.write(row[0])
             self.stdout.write("")
