@@ -145,6 +145,9 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
             with connection.cursor() as cursor:
                 cursor.execute("SET pg_trgm.similarity_threshold = 0.03")
 
+            # Ensure actor table is joined before RawSQL filter
+            queryset = queryset.select_related('actor')
+
             queryset = (
                 queryset.filter(
                     RawSQL(
