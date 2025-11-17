@@ -122,35 +122,33 @@ def perform_trigram_search(queryset, search_term):
     # ILIKE is already case-insensitive; UPPER() prevents trigram index usage
     # GIN trigram indices from migrations 0019 & 0020 accelerate plain ILIKE queries
 
-    # Use UNION instead of OR to allow index usage on each part separately
-    # OR across JOIN prevents index usage; UNION allows each query to use its indices
+    # Use UNION to get IDs efficiently using indices, then filter by those IDs
+    # This allows the final queryset to support select_related() which Django admin requires
 
     from django.db.models import BooleanField
     from django.db.models.expressions import RawSQL
 
-    # Query 1: Search in LogEntry fields (object_repr, changes)
-    # Add similarity annotations first so UNION has matching columns
-    logentry_q = queryset.filter(
+    # Query 1: Search in LogEntry fields (object_repr, changes) - uses trigram indices
+    logentry_ids = queryset.filter(
         Q(object_repr__plain_icontains=search_term) |
         Q(RawSQL("(changes)::text ILIKE %s", (f'%{search_term}%',), output_field=BooleanField()))
-    ).annotate(
-        object_repr_similarity=TrigramSimilarity("object_repr", search_term),
-        changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
-    )
+    ).values_list('id', flat=True)
 
-    # Query 2: Search in actor fields (requires join)
-    # Add same similarity annotations to match Query 1 columns
-    actor_q = queryset.filter(
+    # Query 2: Search in actor fields (requires join) - uses user trigram indices
+    actor_ids = queryset.filter(
         Q(actor__first_name__plain_icontains=search_term) |
         Q(actor__last_name__plain_icontains=search_term) |
         Q(**{f"actor__{username_field}__plain_icontains": search_term})
-    ).annotate(
+    ).values_list('id', flat=True)
+
+    # Combine IDs with UNION to get unique set of matching IDs
+    combined_ids = logentry_ids.union(actor_ids)
+
+    # Filter original queryset by the matched IDs and add similarity annotations
+    # This returns a normal queryset that supports select_related()
+    result_q = queryset.filter(id__in=combined_ids).annotate(
         object_repr_similarity=TrigramSimilarity("object_repr", search_term),
         changes_similarity=TrigramSimilarity(Cast("changes", TextField()), search_term),
-    )
+    ).order_by("-object_repr_similarity", "-changes_similarity")
 
-    # Combine with UNION - use .union() method to generate SQL UNION
-    # The | operator doesn't create UNION when both querysets are from same model
-    combined_q = logentry_q.union(actor_q).order_by("-object_repr_similarity", "-changes_similarity")
-
-    return combined_q, False  # False = don't use additional distinct()
+    return result_q, False  # False = don't use additional distinct()
