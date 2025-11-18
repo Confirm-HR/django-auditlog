@@ -1,20 +1,17 @@
 from functools import cached_property
 
-import re
-from django.apps import apps
 from django.contrib import admin
 from django.contrib.auth import get_user_model
-from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.utils.translation import gettext_lazy as _
 
+from auditlog.admin__confirm_customization import (
+    perform_structured_search,
+    perform_elasticsearch_search,
+)
 from auditlog.filters import CIDFilter, ResourceTypeFilter
 from auditlog.mixins import LogEntryAdminMixin
 from auditlog.models import LogEntry
-
-STRUCTURED_SEARCH_PATTERN = re.compile(
-    r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
-)
 
 
 @admin.register(LogEntry)
@@ -65,62 +62,46 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
 
     def get_queryset(self, request):
         self.request = request
-        queryset = super().get_queryset(request=request)
+        return super().get_queryset(request=request)
 
-        # Custom tampering with Django Admin search.
-        # We support a structured search here to allow
-        # searching for log entries related to a specific object.
-        search = request.GET.get("q")
-        if search:
-            match = STRUCTURED_SEARCH_PATTERN.match(search)
-            if match:
-                try:
-                    model_name = match.group("model_name")
-                    object_id = int(match.group("id"))
-                except (ValueError, TypeError):
-                    # If the format is incorrect, return an empty queryset and show a message
-                    if not getattr(request, "_message_shown", False):
-                        self.message_user(
-                            request,
-                            "Structured search format must be 'ModelName:id'.",
-                            level="warning",
-                        )
-                        request._message_shown = True
-                    return queryset.none()
+    def get_search_results(self, request, queryset, search_term):
+        """
+        Override Django admin search to support custom search modes.
 
-                # Attempt to retrieve the specified model
-                try:
-                    # First try to get the model from the api app
-                    try:
-                        model = apps.get_model(
-                            app_label="api", model_name=model_name
-                        )
-                    except LookupError:
-                        # If not found in api, try to get User model specifically.
-                        if model_name.lower() in ['user', 'customuser']:
-                            model = get_user_model()
-                        else:
-                            raise
-                    if not model:
-                        raise LookupError
-                except LookupError:
-                    if not getattr(request, "_message_shown", False):
-                        self.message_user(
-                            request,
-                            f"Model '{model_name}' does not exist.",
-                            level="warning",
-                        )
-                        request._message_shown = True
-                    return queryset.none()
+        Search priority:
+        1. Structured search (ModelName:ID format, e.g., "Person:123")
+        2. Elasticsearch full-text search (if available and configured)
+        3. ERROR - no fallback to Django default search (would cause SeqScan/OOM)
 
-                # Filter log entries
-                content_type = ContentType.objects.get_for_model(model)
-                queryset = queryset.filter(
-                    content_type=content_type, object_id=object_id
-                )
-                # We need to remove `q` from the request to prevent Django
-                # from trying to search again with structured search query.
-                request.GET = request.GET.copy()
-                request.GET.pop("q", None)
+        Returns:
+            tuple: (queryset, use_distinct)
+        """
+        if not search_term:
+            # No search term, return full queryset
+            return queryset, False
 
-        return queryset  # Return filtered or default queryset based on the presence of `ss`
+        # Try structured search first (ModelName:ID)
+        result = perform_structured_search(
+            request, queryset, search_term, self.message_user
+        )
+        if result is not None:
+            # Structured search matched (either found results or returned empty)
+            return result
+
+        # Try Elasticsearch full-text search
+        result = perform_elasticsearch_search(
+            request, queryset, search_term, self.message_user
+        )
+        if result is not None:
+            # Elasticsearch is available and returned results (could be empty but valid)
+            return result
+
+        # Neither structured search nor Elasticsearch available
+        # Show error instead of falling back to Django search (would cause SeqScan/OOM)
+        self.message_user(
+            request,
+            "Search is not available. Please use structured search (ModelName:ID) "
+            "or contact support if Elasticsearch is not configured.",
+            level="error",
+        )
+        return queryset.none(), False

@@ -1,0 +1,209 @@
+"""
+Confirm HR customizations for django-auditlog admin.
+
+This module contains custom search functionality for the LogEntry admin interface.
+"""
+import re
+from django.apps import apps
+from django.conf import settings
+from django.contrib.auth import get_user_model
+from django.contrib.contenttypes.models import ContentType
+
+# Try to import Elasticsearch - if not available, ES search will be disabled
+try:
+    from elasticsearch import Elasticsearch
+    ELASTICSEARCH_AVAILABLE = True
+except ImportError:
+    ELASTICSEARCH_AVAILABLE = False
+
+
+STRUCTURED_SEARCH_PATTERN = re.compile(
+    r"^(?P<model_name>[A-Za-z_][A-Za-z0-9_]*):(?P<id>[1-9][0-9]*)$"
+)
+
+
+def perform_structured_search(request, queryset, search_term, message_user_func):
+    """
+    Perform structured search on LogEntry queryset.
+
+    Structured search format: ModelName:ID
+    Example: Person:123 or User:456
+
+    This allows searching for all log entries related to a specific object
+    by its model name and ID.
+
+    Args:
+        request: The Django request object
+        queryset: The base LogEntry queryset to filter
+        search_term: The search string (e.g., "Person:123")
+        message_user_func: Function to display messages to user (from ModelAdmin)
+
+    Returns:
+        Tuple of (queryset, use_distinct) if structured search matches.
+        Returns None if not a structured search pattern.
+        Returns (queryset.none(), False) if the pattern matches but model/ID is invalid.
+    """
+    match = STRUCTURED_SEARCH_PATTERN.match(search_term)
+    if not match:
+        # Not a structured search, return None to indicate no match
+        return None
+
+    try:
+        model_name = match.group("model_name")
+        object_id = int(match.group("id"))
+    except (ValueError, TypeError):
+        # If the format is incorrect, return an empty queryset and show a message
+        if not getattr(request, "_message_shown", False):
+            message_user_func(
+                request,
+                "Structured search format must be 'ModelName:id'.",
+                level="warning",
+            )
+            request._message_shown = True
+        return queryset.none(), False
+
+    # Attempt to retrieve the specified model
+    try:
+        # First try to get the model from the api app
+        try:
+            model = apps.get_model(app_label="api", model_name=model_name)
+        except LookupError:
+            # If not found in api, try to get User model specifically
+            if model_name.lower() in ['user', 'customuser']:
+                model = get_user_model()
+            else:
+                raise
+        if not model:
+            raise LookupError
+    except LookupError:
+        if not getattr(request, "_message_shown", False):
+            message_user_func(
+                request,
+                f"Model '{model_name}' does not exist.",
+                level="warning",
+            )
+            request._message_shown = True
+        return queryset.none(), False
+
+    # Filter log entries by content_type and object_id
+    content_type = ContentType.objects.get_for_model(model)
+    filtered_queryset = queryset.filter(
+        content_type=content_type, object_id=object_id
+    )
+
+    return filtered_queryset, False
+
+
+def perform_elasticsearch_search(request, queryset, search_term, message_user_func):
+    """
+    Perform full-text search using Elasticsearch.
+
+    This function searches the auditlog_logentry index in Elasticsearch
+    and returns a queryset filtered by the matching IDs, ordered by
+    Elasticsearch relevance score.
+
+    If Elasticsearch is not available or not configured, returns None
+    to fall back to default Django search.
+
+    Args:
+        request: The Django request object
+        queryset: The base LogEntry queryset to filter
+        search_term: The search string
+        message_user_func: Function to display messages to user (from ModelAdmin)
+
+    Returns:
+        Tuple of (queryset, use_distinct) if Elasticsearch search succeeds.
+        Returns None if Elasticsearch is not available/configured.
+    """
+    from django.db.models import Case, When, FloatField, Value
+
+    # Check if Elasticsearch is available
+    if not ELASTICSEARCH_AVAILABLE:
+        return None
+
+    # Check if Elasticsearch is configured in settings
+    if not hasattr(settings, 'ELASTICSEARCH_DSL'):
+        return None
+
+    try:
+        # Initialize Elasticsearch client
+        es_config = settings.ELASTICSEARCH_DSL.get("default", {})
+        if not es_config:
+            return None
+
+        es = Elasticsearch(
+            hosts=[es_config.get("hosts")],
+            timeout=es_config.get("timeout", 30),
+            max_retries=es_config.get("max_retries", 3),
+            retry_on_timeout=es_config.get("retry_on_timeout", True),
+        )
+
+        # Check if index exists
+        index_name = "auditlog_logentry"
+        if not es.indices.exists(index=index_name):
+            # Index doesn't exist, fall back to default search
+            return None
+
+        # Perform Elasticsearch search
+        # Search across all searchable fields with multi_match
+        es_query = {
+            "query": {
+                "multi_match": {
+                    "query": search_term,
+                    "fields": [
+                        "object_repr^2",  # Boost object_repr matches
+                        "changes_searchable",
+                        "actor_email",
+                        "actor_first_name",
+                        "actor_last_name",
+                        "actor_username",
+                    ],
+                    "type": "best_fields",
+                    "operator": "and",  # All terms must match
+                    "fuzziness": "AUTO",  # Allow fuzzy matching for typos
+                }
+            },
+            "size": 10000,  # Max results to retrieve
+            "_source": False,  # We only need IDs and scores
+        }
+
+        # Execute search
+        response = es.search(index=index_name, body=es_query)
+
+        # Extract matching IDs with their scores
+        hits = response.get("hits", {}).get("hits", [])
+        if not hits:
+            # No matches found, return empty queryset
+            return queryset.none(), False
+
+        # Build list of (id, score) tuples
+        id_score_pairs = [(int(hit["_id"]), hit["_score"]) for hit in hits]
+        matching_ids = [id_val for id_val, _ in id_score_pairs]
+
+        # Filter queryset by matching IDs
+        filtered_queryset = queryset.filter(id__in=matching_ids)
+
+        # Annotate with Elasticsearch score using Case/When
+        # This maps each ID to its ES score
+        score_cases = [
+            When(id=id_val, then=Value(score))
+            for id_val, score in id_score_pairs
+        ]
+
+        filtered_queryset = filtered_queryset.annotate(
+            es_score=Case(
+                *score_cases,
+                default=Value(0.0),
+                output_field=FloatField()
+            )
+        ).order_by('-es_score')  # Order by ES score descending (most relevant first)
+
+        return filtered_queryset, False
+
+    except Exception as e:
+        # If anything goes wrong with Elasticsearch, fall back to default search
+        # Optionally log the error for debugging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Elasticsearch search failed, falling back to Django search: {e}")
+        return None
