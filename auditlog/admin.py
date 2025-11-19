@@ -30,14 +30,9 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
         "user_url",
         "cid_url",
     ]
-    search_fields = [
-        "timestamp",
-        "object_repr",
-        "changes",
-        "actor__first_name",
-        "actor__last_name",
-        f"actor__{get_user_model().USERNAME_FIELD}",
-    ]
+    # search_fields not needed - get_search_results() is completely overridden
+    # All search is handled by custom logic (StructuredSearch or Elasticsearch)
+    # search_fields = []
     list_filter = ["action", ResourceTypeFilter, CIDFilter]
     readonly_fields = ["created", "resource_url", "action", "user_url", "msg"]
     fieldsets = [
@@ -67,9 +62,10 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
     def get_queryset(self, request):
         self.request = request
         qs = super().get_queryset(request=request)
-        # Performance optimization: Defer large JSONFields not used in list view
-        # This prevents fetching serialized_data and additional_data for every row
-        return qs.defer('serialized_data', 'additional_data')
+        # Performance optimization: Defer large fields not used in list view
+        # changes_text (TextField) and changes (JSONField) are only needed in detail view
+        # This reduces row width from ~1.5KB to much smaller size
+        return qs.defer('serialized_data', 'additional_data', 'changes', 'changes_text')
 
     def get_search_results(self, request, queryset, search_term):
         """
