@@ -99,11 +99,11 @@ def perform_elasticsearch_search(request, queryset, search_term, message_user_fu
     Perform full-text search using Elasticsearch with pagination support.
 
     This function searches the auditlog_logentry index in Elasticsearch
-    and returns a queryset filtered by the matching IDs, ordered by
-    Elasticsearch relevance score.
+    and returns a queryset filtered by the matching IDs, ordered by timestamp.
 
-    Pagination:
-    - Fetches all matching IDs from Elasticsearch (up to 10k limit)
+    Performance:
+    - Limits to 200 results for performance (COUNT query on large result sets is slow)
+    - Warns user if more than 200 results exist
     - Returns a Django queryset that supports .count() and slicing
     - Django admin handles pagination by slicing the queryset
     - Only the rows for the current page are fetched from the database
@@ -151,6 +151,7 @@ def perform_elasticsearch_search(request, queryset, search_term, message_user_fu
 
         # Perform Elasticsearch search
         # Search across all searchable fields with multi_match
+        # Limit to 200 results for performance (COUNT query on 10k IDs is too slow)
         es_query = {
             "query": {
                 "multi_match": {
@@ -168,9 +169,7 @@ def perform_elasticsearch_search(request, queryset, search_term, message_user_fu
                     "fuzziness": "AUTO",  # Allow fuzzy matching for typos
                 }
             },
-            # Fetch all matching IDs up to limit
-            # Django admin will paginate by slicing the queryset later
-            "size": 10000,
+            "size": 200,  # Limit to 200 results for performance
             "_source": False,  # We only need IDs and scores
         }
 
@@ -188,10 +187,10 @@ def perform_elasticsearch_search(request, queryset, search_term, message_user_fu
             total_count = total_hits
 
         # Warn if results are truncated
-        if total_count > 10000:
+        if total_count > 200:
             message_user_func(
                 request,
-                f"Search returned {total_count:,} results, showing first 10,000. "
+                f"Search returned {total_count:,} results, showing first 200. "
                 "Please refine your search for better results.",
                 level="warning",
             )
