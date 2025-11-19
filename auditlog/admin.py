@@ -16,13 +16,17 @@ from auditlog.models import LogEntry
 
 @admin.register(LogEntry)
 class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
+    # Performance optimization: Disable expensive full result count
+    # This eliminates the COUNT(*) query on large result sets (10k+ IDs)
+    show_full_result_count = False
+
     date_hierarchy = "timestamp"
     list_select_related = ["content_type", "actor"]
     list_display = [
         "created",
         "resource_url",
         "action",
-        "msg_short",
+        # Removed "msg_short" - causes expensive JSON parsing (changes_dict) for every row
         "user_url",
         "cid_url",
     ]
@@ -62,7 +66,10 @@ class LogEntryAdmin(admin.ModelAdmin, LogEntryAdminMixin):
 
     def get_queryset(self, request):
         self.request = request
-        return super().get_queryset(request=request)
+        qs = super().get_queryset(request=request)
+        # Performance optimization: Defer large JSONFields not used in list view
+        # This prevents fetching serialized_data and additional_data for every row
+        return qs.defer('serialized_data', 'additional_data')
 
     def get_search_results(self, request, queryset, search_term):
         """
