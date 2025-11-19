@@ -200,26 +200,13 @@ def perform_elasticsearch_search(request, queryset, search_term, message_user_fu
             # No matches found, return empty queryset
             return queryset.none(), False
 
-        # Build list of (id, score) tuples preserving ES relevance order
-        id_score_pairs = [(int(hit["_id"]), hit["_score"]) for hit in hits]
+        # Extract just the IDs in relevance order
+        matching_ids = [int(hit["_id"]) for hit in hits]
 
         # Filter queryset by matching IDs
-        filtered_queryset = queryset.filter(id__in=[id_val for id_val, _ in id_score_pairs])
-
-        # Annotate with Elasticsearch score using Case/When
-        # This preserves the ES relevance ordering in the queryset
-        score_cases = [
-            When(id=id_val, then=Value(score))
-            for id_val, score in id_score_pairs
-        ]
-
-        filtered_queryset = filtered_queryset.annotate(
-            es_score=Case(
-                *score_cases,
-                default=Value(0.0),
-                output_field=FloatField()
-            )
-        ).order_by('-es_score')  # Order by ES score descending (most relevant first)
+        # Note: We can't preserve ES relevance order in Django queryset without expensive Case/When
+        # Default to ordering by timestamp descending (most recent first)
+        filtered_queryset = queryset.filter(id__in=matching_ids).order_by('-timestamp')
 
         # Django admin will paginate this queryset via slicing (e.g., queryset[0:100])
         # Only the rows for the current page will be fetched from the database
